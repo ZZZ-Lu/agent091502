@@ -1,0 +1,6 @@
+{
+  "name": "user.ask",
+  "arguments": {
+    "question": "测试向用户提问功能"
+  }
+}

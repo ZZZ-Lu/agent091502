@@ -1,0 +1,518 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { motion, AnimatePresence, MotionValue } from 'motion/react';
+import { 
+  RefreshCw,
+  Plus,
+  ChevronDown,
+  ArrowUp,
+  Layers,
+  Trash2
+} from 'lucide-react';
+
+export type CardState = 'draft' | 'generating' | 'completed';
+export type AspectRatio = '1:1' | '3:4' | '9:16' | '16:9';
+export type Resolution = '1K' | '2K' | '4K';
+
+export const CARD_DIMENSIONS: Record<AspectRatio, { width: number, height: number }> = {
+  '1:1': { width: 480, height: 480 },
+  '3:4': { width: 420, height: 560 },
+  '9:16': { width: 360, height: 640 },
+  '16:9': { width: 640, height: 360 }
+};
+
+export interface CardData {
+  id: string;
+  x: number;
+  y: number;
+  state: CardState;
+  ratio: AspectRatio;
+  res: Resolution;
+  prompt: string;
+  imageUrl: string | null;
+}
+
+export interface GenerationCardProps {
+  key?: React.Key;
+  data: CardData;
+  scale: MotionValue<number>;
+  tx: MotionValue<number>;
+  ty: MotionValue<number>;
+  isMicroLod?: boolean;
+  isSelected?: boolean;
+  onSelect?: (e: React.PointerEvent, id: string) => void;
+  onDrag?: (id: string, dx: number, dy: number) => void;
+  onDragEnd?: (id: string, totalDx: number, totalDy: number) => void;
+  onDelete?: (id: string) => void;
+  onUpdate: (id: string, updates: Partial<CardData>, isSignificant?: boolean) => void;
+}
+
+export const GenerationCard = React.memo(function GenerationCard({ 
+  data, 
+  scale, 
+  tx, 
+  ty, 
+  isMicroLod,
+  isSelected, 
+  onSelect, 
+  onDrag, 
+  onDragEnd, 
+  onDelete, 
+  onUpdate 
+}: GenerationCardProps) {
+  const { id, x, y, state, ratio, res, prompt, imageUrl } = data;
+  
+  const [openMenu, setOpenMenu] = useState<{ type: 'ratio' | 'res', ownerId: string } | null>(null);
+  
+  const cardRef = useRef<HTMLDivElement>(null);
+  const menuContainerRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Micro-LOD state tracking (scale < 0.25)
+  const [internalIsMicro, setInternalIsMicro] = useState(() => isMicroLod ?? (scale.get() < 0.25));
+
+  useEffect(() => {
+    if (typeof isMicroLod === 'boolean') {
+      setInternalIsMicro(isMicroLod);
+      return;
+    }
+    const unsub = scale.on('change', (v) => {
+      const micro = v < 0.25;
+      setInternalIsMicro(prev => (prev !== micro ? micro : prev));
+    });
+    return unsub;
+  }, [scale, isMicroLod]);
+
+  const activeMicro = isMicroLod ?? internalIsMicro;
+  
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+      const scrollHeight = textareaRef.current.scrollHeight;
+      textareaRef.current.style.height = `${scrollHeight}px`;
+      
+      if (scrollHeight >= 300) {
+        textareaRef.current.style.overflowY = 'auto';
+      } else {
+        textareaRef.current.style.overflowY = 'hidden';
+      }
+    }
+  }, [prompt]);
+
+  // Track dragging locally for 0-latency, then sync on pointer up
+  const posRef = useRef({ x, y });
+  const isDragging = useRef(false);
+  const lastPos = useRef({ x: 0, y: 0 });
+  const slaveNodesRef = useRef<{ el: HTMLElement, initialX: number, initialY: number }[]>([]);
+  const totalDx = useRef(0);
+  const totalDy = useRef(0);
+
+  useEffect(() => {
+    const closeMenu = (e: PointerEvent) => {
+      if (menuContainerRef.current && !menuContainerRef.current.contains(e.target as Node)) {
+        setOpenMenu(prev => {
+          if (!prev) return null;
+          // If a user clicks, don't close agent's menu
+          if (e.isTrusted && prev.ownerId !== 'user') return prev;
+          // If an agent clicks, don't close user's menu
+          if (!e.isTrusted && prev.ownerId === 'user') return prev;
+          
+          return null;
+        });
+      }
+    };
+    document.addEventListener('pointerdown', closeMenu);
+    return () => {
+      document.removeEventListener('pointerdown', closeMenu);
+    };
+  }, []);
+
+  // Update transform if external x/y change and not dragging
+  useEffect(() => {
+    if (!isDragging.current && cardRef.current) {
+      posRef.current = { x, y };
+      cardRef.current.style.transform = `translate(${x}px, ${y}px)`;
+    }
+  }, [x, y]);
+
+  const onPointerDown = (e: React.PointerEvent) => {
+    if (e.button !== 0) return; // Only left click
+    e.stopPropagation();
+    
+    isDragging.current = true;
+    (window as any).isDraggingCard = true;
+    lastPos.current = { x: e.clientX, y: e.clientY };
+    totalDx.current = 0;
+    totalDy.current = 0;
+    e.currentTarget.setPointerCapture(e.pointerId);
+
+    // Master-Slave DOM sync preparation
+    if (isSelected) {
+      const selectedNodes = document.querySelectorAll('[data-card-id][data-selected="true"]');
+      const slaves: { el: HTMLElement, initialX: number, initialY: number }[] = [];
+      selectedNodes.forEach(node => {
+        if (node !== cardRef.current) {
+          const el = node as HTMLElement;
+          const transform = el.style.transform;
+          const match = transform.match(/translate\(([-\d.]+)px,\s*([-\d.]+)px\)/);
+          if (match) {
+            slaves.push({ el, initialX: parseFloat(match[1]), initialY: parseFloat(match[2]) });
+          }
+        }
+      });
+      slaveNodesRef.current = slaves;
+    } else {
+      slaveNodesRef.current = [];
+    }
+  };
+
+  const handleContainerPointerDown = (e: React.PointerEvent) => {
+    // Prevent middle click from focusing or interacting with card content
+    // so it smoothly falls through to the canvas drag handler
+    if (e.button === 1) {
+      e.preventDefault();
+      return;
+    }
+    if (e.button === 0) {
+      onSelect?.(e, id);
+    }
+  };
+
+  const onPointerMove = (e: React.PointerEvent) => {
+    if (!isDragging.current) return;
+    
+    // Calculate movement in canvas space (accounting for zoom scale)
+    const currentScale = scale.get();
+    const dx = (e.clientX - lastPos.current.x) / currentScale;
+    const dy = (e.clientY - lastPos.current.y) / currentScale;
+    lastPos.current = { x: e.clientX, y: e.clientY };
+    
+    posRef.current.x += dx;
+    posRef.current.y += dy;
+    totalDx.current += dx;
+    totalDy.current += dy;
+    
+    // Direct DOM manipulation for zero-latency dragging
+    if (cardRef.current) {
+      cardRef.current.style.transform = `translate(${posRef.current.x}px, ${posRef.current.y}px)`;
+    }
+    
+    // Sync Slaves
+    slaveNodesRef.current.forEach(slave => {
+      slave.el.style.transform = `translate(${slave.initialX + totalDx.current}px, ${slave.initialY + totalDy.current}px)`;
+    });
+    
+    if (onDrag) {
+      onDrag(id, dx, dy);
+    }
+  };
+
+  const onPointerUp = (e: React.PointerEvent) => {
+    if (isDragging.current) {
+      isDragging.current = false;
+      (window as any).isDraggingCard = false;
+      if (typeof (window as any).resetGlobalZoomTimer === 'function') {
+        (window as any).resetGlobalZoomTimer();
+      }
+      if (onDragEnd) {
+        onDragEnd(id, totalDx.current, totalDy.current);
+      } else {
+        onUpdate(id, { x: posRef.current.x, y: posRef.current.y }, true);
+      }
+    }
+    e.currentTarget.releasePointerCapture(e.pointerId);
+  };
+
+  const handleGenerate = () => {
+    if (!prompt.trim()) return;
+    onUpdate(id, { state: 'generating' }, true);
+    
+    // Simulate generation
+    setTimeout(() => {
+      onUpdate(id, { 
+        imageUrl: "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=800&auto=format&fit=crop",
+        state: 'completed'
+      });
+    }, 2500);
+  };
+
+  const ratios: AspectRatio[] = ['1:1', '3:4', '9:16', '16:9'];
+  const resolutions: Resolution[] = ['1K', '2K', '4K'];
+
+  // --- Micro-LOD Shell (scale < 0.25) ---
+  // When zoomed out to micro scale, eliminate all nested DOM nodes, SVGs, controls, and animations.
+  // Render only a single shell div with background and basic corner radius, keeping interaction and movement.
+  if (activeMicro) {
+    const dim = CARD_DIMENSIONS[ratio];
+    return (
+      <div 
+        ref={cardRef}
+        data-card-id={id}
+        data-micro-lod="true"
+        data-selected={isSelected ? 'true' : 'false'}
+        className={`absolute top-0 left-0 pointer-events-auto cursor-grab active:cursor-grabbing squircle rounded-2xl transition-colors duration-150 ${
+          isSelected 
+            ? 'outline outline-2 outline-[#3b82f6] border-transparent shadow-md -translate-y-1' 
+            : 'border border-gray-200/90 dark:border-[#404040]/90 shadow-[0_1px_2px_rgba(0,0,0,0.06),0_0_1px_rgba(0,0,0,0.08)] dark:shadow-[0_1px_2px_rgba(0,0,0,0.35)] translate-y-0'
+        } ${
+          imageUrl 
+            ? 'bg-cover bg-center bg-no-repeat bg-gray-100 dark:bg-neutral-800' 
+            : 'bg-gray-100 dark:bg-neutral-800'
+        }`}
+        style={{ 
+          transform: `translate(${x}px, ${y}px)`,
+          width: dim.width,
+          height: dim.height,
+          backgroundImage: imageUrl ? `url(${imageUrl})` : undefined,
+          outlineWidth: isSelected ? 'calc(2px / var(--current-scale, 1))' : '0px',
+        }}
+        onPointerDownCapture={handleContainerPointerDown}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
+      />
+    );
+  }
+
+  return (
+    <motion.div 
+      ref={cardRef}
+      data-card-id={id}
+      data-selected={isSelected ? 'true' : 'false'}
+      className={`absolute top-0 left-0 pointer-events-none ${isDragging.current ? 'will-change-transform z-10' : (isSelected ? 'z-10' : 'z-0')}`}
+      style={{ transformOrigin: 'top left', transform: `translate(${x}px, ${y}px)` }}
+      onPointerDownCapture={handleContainerPointerDown}
+    >
+      <motion.div
+        initial={false}
+        animate={{ scale: 1, opacity: 1, y: 0 }}
+        transformTemplate={(_, generated) => generated.replace(/translateZ\([^)]+\)/g, '')}
+        transition={{ 
+          type: 'spring', 
+          stiffness: 300, 
+          damping: 22, 
+          mass: 0.7 
+        }}
+        className="flex flex-col gap-3 group items-start"
+        style={{ transformOrigin: '50% 50%' }}
+      >
+        {/* Top Layer: Image Placeholder & Drag Handle */}
+        <div 
+          className={`pointer-events-auto relative shrink-0 overflow-hidden cursor-grab active:cursor-grabbing bg-gray-100 dark:bg-neutral-800 squircle self-start ease-out group-data-[scale-micro=true]/canvas:!border-none group-data-[zooming=true]/canvas:!shadow-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform ${isSelected ? 'outline outline-[#3b82f6]' : 'outline-none'} ${
+            isSelected 
+              ? 'border-transparent shadow-[0_20px_40px_-8px_rgba(0,0,0,0.2),0_12px_24px_-6px_rgba(0,0,0,0.12)] dark:shadow-[0_24px_48px_-8px_rgba(0,0,0,0.6)] -translate-y-1' 
+              : 'border border-gray-200/90 dark:border-[#404040]/90 shadow-[0_1px_2px_rgba(0,0,0,0.06),0_0_1px_rgba(0,0,0,0.08)] dark:shadow-[0_1px_2px_rgba(0,0,0,0.35)] translate-y-0 hover:shadow-[0_3px_8px_rgba(0,0,0,0.08)] hover:border-gray-300 dark:hover:border-neutral-600'
+          }`}
+          style={{ 
+            width: CARD_DIMENSIONS[ratio].width, 
+            height: CARD_DIMENSIONS[ratio].height,
+            backgroundImage: imageUrl ? `url(${imageUrl})` : undefined,
+            backgroundSize: 'cover',
+            backgroundPosition: 'center',
+            outlineWidth: isSelected ? 'calc(2px / var(--current-scale, 1))' : '0px',
+            boxShadow: isSelected ? '0 20px 40px -8px rgba(0, 0, 0, 0.22)' : undefined,
+            transitionProperty: 'box-shadow, transform, border-color, width, height',
+            transitionDuration: '180ms',
+            transitionTimingFunction: 'ease-out'
+          }}
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerUp}
+        >
+        {/* Empty State Placeholder (SVG matching user request) */}
+        <div className={`absolute inset-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-800 transition-opacity duration-500 ${!imageUrl ? 'opacity-100' : 'opacity-0'}`}>
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-gray-300 dark:text-neutral-600">
+            {/* Star */}
+            <path d="M8.5 2C8.8 4.5 10.5 6.2 13 6.5C10.5 6.8 8.8 8.5 8.5 11C8.2 8.5 6.5 6.8 4 6.5C6.5 6.2 8.2 4.5 8.5 2Z" fill="currentColor"/>
+            {/* Big Mountain */}
+            <path d="M15.5 10L22 20H9L15.5 10Z" fill="currentColor"/>
+            {/* Small Mountain */}
+            <path d="M8.5 13L13 20H4L8.5 13Z" fill="currentColor"/>
+          </svg>
+        </div>
+
+        {/* Generated Image */}
+        {imageUrl && (
+          <motion.img 
+            initial={{ opacity: 0 }}
+            animate={{ 
+              opacity: 1, 
+              filter: state === 'generating' ? 'blur(12px) brightness(0.95)' : 'blur(0px) brightness(1)' 
+            }}
+            src={imageUrl} 
+            className={`absolute inset-0 w-full h-full object-cover transition-all duration-700 pointer-events-none group-data-[zooming=true]/canvas:!filter-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform`}
+            alt="Artwork"
+          />
+        )}
+
+        {/* Generating State Overlay */}
+        <AnimatePresence>
+          {state === 'generating' && (
+            <motion.div 
+              initial={{ opacity: 0 }} 
+              animate={{ opacity: 1 }} 
+              exit={{ opacity: 0 }}
+              className={`absolute inset-0 flex flex-col items-center justify-center bg-gray-100 pointer-events-none z-10 group-data-[zooming=true]/canvas:opacity-0 group-data-[zooming=true]/canvas:will-change-transform`}
+            >
+              <RefreshCw className="w-8 h-8 text-purple-600 animate-spin mb-3 drop-shadow-sm" />
+              <span className="text-xs text-purple-700 font-bold tracking-widest uppercase drop-shadow-sm">Rendering</span>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      {/* Bottom Layer: Light Panel */}
+      <div 
+        className={`pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 squircle p-4 gap-2 w-[480px] border border-gray-200/80 dark:border-[#404040] cursor-default self-start ease-out group-data-[scale-micro=true]/canvas:!opacity-0 group-data-[scale-micro=true]/canvas:!pointer-events-none group-data-[zooming=true]/canvas:!shadow-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform ${
+        state === 'completed' && !isSelected ? 'opacity-0 pointer-events-none' : 'opacity-100'
+      } ${
+        isSelected 
+          ? 'shadow-[0_16px_36px_-6px_rgba(0,0,0,0.12),0_8px_16px_-4px_rgba(0,0,0,0.06)] dark:shadow-[0_20px_40px_-6px_rgba(0,0,0,0.45)] -translate-y-0.5' 
+          : 'shadow-[0_1px_3px_rgba(0,0,0,0.05),0_1px_2px_rgba(0,0,0,0.03)] dark:shadow-none translate-y-0'
+      }`}
+        style={{
+          marginLeft: (CARD_DIMENSIONS[ratio].width - 480) / 2,
+          transitionProperty: 'box-shadow, transform, opacity',
+          transitionDuration: '180ms'
+        }}
+      >
+        
+        {/* Top: Reference & Actions */}
+        <div className="flex items-start justify-between">
+          <button className={`flex items-center gap-1.5 bg-gray-100 dark:bg-neutral-800 hover:bg-gray-200 dark:hover:bg-neutral-700 border border-gray-200 dark:border-[#404040] text-gray-700 dark:text-neutral-300 px-3 py-1.5 rounded-xl corner-squircle text-[12px] font-medium transition-colors shadow-sm group-data-[zooming=true]/canvas:!shadow-none`}>
+            <Plus className="w-3.5 h-3.5" /> 参考图
+          </button>
+          
+          {isSelected && (
+            <button 
+              onClick={() => onDelete?.(id)}
+              className="text-gray-400 dark:text-neutral-500 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950 p-1.5 rounded-lg corner-squircle transition-colors"
+              title="删除 (Backspace/Delete)"
+            >
+              <Trash2 className="w-4 h-4" />
+            </button>
+          )}
+        </div>
+
+        {/* Middle: Prompt Textarea */}
+        <textarea
+          ref={textareaRef}
+          data-agent-target={`prompt-input-${id}`}
+          value={prompt}
+          onPointerDown={(e) => {
+            // Prevent middle-click from focusing the textarea so canvas panning works smoothly
+            if (e.button === 1) {
+              e.preventDefault();
+            }
+          }}
+          onChange={(e) => onUpdate(id, { prompt: e.target.value })}
+          disabled={state === 'generating'}
+          placeholder="输入文字指令，例如：清冷克制的女主，穿白衬衫..."
+          className="w-full bg-transparent border-0 text-gray-800 dark:text-neutral-100 placeholder-gray-400 dark:placeholder-neutral-500 text-[14px] leading-relaxed resize-none focus:outline-none min-h-[50px] max-h-[300px] overflow-hidden font-medium mt-1"
+          rows={2}
+        />
+
+        {/* Bottom Action Bar */}
+        <div className="flex items-center justify-between mt-2 pt-2 border-t border-gray-100 dark:border-[#404040]">
+          
+          {/* Left Controls: Parameters */}
+          <div ref={menuContainerRef} className="flex items-center gap-4 text-gray-500 dark:text-neutral-400 text-[13px]">
+            {/* Ratio Dropdown */}
+            <div className="relative">
+              <button
+                data-agent-target={`ratio-btn-${id}`}
+                onClick={(e) => {
+                  const isAgent = !e.nativeEvent.isTrusted;
+                  setOpenMenu(prev => prev?.type === 'ratio' ? null : { type: 'ratio', ownerId: isAgent ? 'agent' : 'user' });
+                }}
+                className={`flex items-center gap-1.5 transition-colors group ${openMenu?.type === 'ratio' ? 'text-gray-900 dark:text-neutral-100' : 'hover:text-gray-900 dark:hover:text-neutral-200'}`}
+              >
+                <div className="w-3.5 h-3 border-2 border-current rounded-[3px] opacity-70" />
+                <span className="font-semibold">{ratio}</span>
+                <ChevronDown className="w-3 h-3 opacity-50 group-hover:opacity-100" />
+              </button>
+              
+              <AnimatePresence>
+                {openMenu?.type === 'ratio' && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 5 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 5 }}
+                    transition={{ duration: 0.15 }}
+                    className="absolute bottom-[calc(100%+12px)] left-0 w-28 bg-gray-100 dark:bg-neutral-800 border border-gray-100 dark:border-[#404040] rounded-xl corner-squircle shadow-[0_8px_30px_rgb(0,0,0,0.12)] p-1.5 z-50 flex flex-col"
+                  >
+                    {ratios.map(r => (
+                      <button 
+                        key={r}
+                        data-agent-target={`ratio-option-${id}-${r}`}
+                        onClick={() => { onUpdate(id, { ratio: r }, true); setOpenMenu(null); }}
+                        className={`text-left px-3 py-2 rounded-lg corner-squircle text-[13px] font-medium transition-colors ${r === ratio ? 'bg-gray-100 dark:bg-neutral-700 text-gray-900 dark:text-white' : 'text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700'}`}
+                      >
+                        {r}
+                      </button>
+                    ))}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+            
+            <div className="w-[1px] h-3.5 bg-gray-300 dark:bg-neutral-700" />
+            
+            {/* Resolution Dropdown */}
+            <div className="relative">
+              <button 
+                data-agent-target={`res-btn-${id}`}
+                onClick={(e) => {
+                  const isAgent = !e.nativeEvent.isTrusted;
+                  setOpenMenu(prev => prev?.type === 'res' ? null : { type: 'res', ownerId: isAgent ? 'agent' : 'user' });
+                }}
+                className={`flex items-center gap-1.5 transition-colors group ${openMenu?.type === 'res' ? 'text-gray-900 dark:text-neutral-100' : 'hover:text-gray-900 dark:hover:text-neutral-200'}`}
+              >
+                <Layers className="w-3.5 h-3.5 opacity-70" />
+                <span className="font-semibold">{res}</span>
+                <ChevronDown className="w-3 h-3 opacity-50 group-hover:opacity-100" />
+              </button>
+
+              <AnimatePresence>
+                {openMenu?.type === 'res' && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 5 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 5 }}
+                    transition={{ duration: 0.15 }}
+                    className="absolute bottom-[calc(100%+12px)] left-0 w-24 bg-gray-100 dark:bg-neutral-800 border border-gray-100 dark:border-[#404040] rounded-xl corner-squircle shadow-[0_8px_30px_rgb(0,0,0,0.12)] p-1.5 z-50 flex flex-col"
+                  >
+                    {resolutions.map(r => (
+                      <button 
+                        key={r}
+                        data-agent-target={`res-option-${id}-${r}`}
+                        onClick={() => { onUpdate(id, { res: r }, true); setOpenMenu(null); }}
+                        className={`text-left px-3 py-2 rounded-lg corner-squircle text-[13px] font-medium transition-colors ${r === res ? 'bg-gray-100 dark:bg-neutral-700 text-gray-900 dark:text-white' : 'text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700'}`}
+                      >
+                        {r}
+                      </button>
+                    ))}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          </div>
+
+          {/* Right Controls: Generate Arrow */}
+          <button
+            data-agent-target={`generate-btn-${id}`}
+            onClick={handleGenerate}
+            disabled={!prompt.trim() || state === 'generating'}
+            className="w-8 h-8 rounded-full bg-gray-900 dark:bg-neutral-100 text-white dark:text-neutral-900 flex items-center justify-center hover:bg-black dark:hover:bg-white/10 disabled:opacity-50 transition-colors shadow-md"
+          >
+            <ArrowUp className="w-4 h-4 stroke-[3]" />
+          </button>
+        </div>
+      </div>
+      </motion.div>
+    </motion.div>
+  );
+});
+
+

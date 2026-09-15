@@ -1,0 +1,6 @@
+{
+  "name": "Infinite Canvas",
+  "description": "An infinite creative workspace with script bible, character and asset extraction, and agent-driven visual generation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

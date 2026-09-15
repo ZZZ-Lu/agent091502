@@ -1,0 +1,9 @@
+node_modules/
+node_modules.corrupted-install/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
