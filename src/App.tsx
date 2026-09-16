@@ -2,8 +2,10 @@ import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react'
 import { AgentCursor } from './components/AgentCursor';
 import { AgentContextMenu } from './components/AgentContextMenu';
 import { GenerationCard, CardData, CARD_DIMENSIONS } from './components/GenerationCard';
+import { NanoLodCanvas } from './components/NanoLodCanvas';
+import { generateImageThumbnail, generateVideoThumbnail, getOrCreateMediaThumbnail, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
 import { isCardIntersectingCircle } from './utils/viewportCulling';
-import { Plus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X } from 'lucide-react';
+import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X } from 'lucide-react';
 import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
 import { SettingsPage } from './components/SettingsPage';
 import { ProjectScriptBible } from './components/ProjectScriptBible';
@@ -108,6 +110,95 @@ type ScriptSelection = {
   lineEnd: number;
 } | null;
 
+interface MediaDimensions {
+  width: number;
+  height: number;
+}
+
+const getImageDimensions = (url: string): Promise<MediaDimensions> => {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+    img.onerror = () => resolve({ width: 420, height: 560 });
+    img.src = url;
+  });
+};
+
+const getVideoDimensions = (url: string): Promise<MediaDimensions> => {
+  return new Promise((resolve) => {
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.onloadedmetadata = () => resolve({ width: video.videoWidth, height: video.videoHeight });
+    video.onerror = () => resolve({ width: 640, height: 360 });
+    video.src = url;
+  });
+};
+
+const compressAndResizeImage = (file: File, maxDim = 1200, quality = 0.85): Promise<Blob> => {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        let width = img.naturalWidth;
+        let height = img.naturalHeight;
+        
+        if (width > maxDim || height > maxDim) {
+          if (width > height) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          } else {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
+        
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          const mimeType = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
+          canvas.toBlob((blob) => {
+            resolve(blob || file);
+          }, mimeType, quality);
+        } else {
+          resolve(file);
+        }
+      };
+      img.onerror = () => resolve(file);
+      img.src = e.target?.result as string;
+    };
+    reader.onerror = () => resolve(file);
+    reader.readAsDataURL(file);
+  });
+};
+
+const getClosestAspectRatio = (width: number, height: number): '1:1' | '3:4' | '9:16' | '16:9' => {
+  if (!width || !height) return '3:4';
+  const fileRatio = width / height;
+  const presets: { ratio: '1:1' | '3:4' | '9:16' | '16:9'; value: number }[] = [
+    { ratio: '1:1', value: 1.0 },
+    { ratio: '3:4', value: 0.75 },
+    { ratio: '9:16', value: 0.5625 },
+    { ratio: '16:9', value: 1.7778 }
+  ];
+
+  let closestRatio: '1:1' | '3:4' | '9:16' | '16:9' = '3:4';
+  let minDiff = Infinity;
+
+  presets.forEach((preset) => {
+    const diff = Math.abs(fileRatio - preset.value);
+    if (diff < minDiff) {
+      minDiff = diff;
+      closestRatio = preset.ratio;
+    }
+  });
+
+  return closestRatio;
+};
+
 export default function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   
@@ -178,6 +269,15 @@ export default function App() {
   useEffect(() => {
     showSettingsRef.current = showSettings;
   }, [showSettings]);
+
+  const [zoomScale, setZoomScale] = useState(() => tScale.get());
+
+  useEffect(() => {
+    const unsub = tScale.on('change', (s) => {
+      setZoomScale(s);
+    });
+    return () => unsub();
+  }, [tScale]);
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', isDarkMode);
@@ -349,6 +449,7 @@ export default function App() {
 
   const [isDragging, setIsDragging] = useState(false);
   const [isZooming, setIsZooming] = useState(false);
+  const isZoomingRef = useRef(false);
   const zoomTimeoutRef = useRef<NodeJS.Timeout>();
   const lastPointer = useRef({ x: 0, y: 0 });
   const [selectedCardIds, setSelectedCardIds] = useState<string[]>([]);
@@ -423,6 +524,13 @@ export default function App() {
   const cardsRef = useRef<CardData[]>(cards);
   cardsRef.current = cards;
   const clipboardRef = useRef<CardData[]>([]);
+  const nanoDragRef = useRef<{
+    cardId: string;
+    startX: number;
+    startY: number;
+    didMove: boolean;
+    initialCards: { id: string; x: number; y: number }[];
+  } | null>(null);
   const loadedProjectIdRef = useRef<string | null>(null);
 
   const setCards = (updater: CardData[] | ((prev: CardData[]) => CardData[]), pushToHistory = true) => {
@@ -436,6 +544,163 @@ export default function App() {
       }
     });
   };
+
+  // --- Local File Drag and Drop Support ---
+  const [isDragOver, setIsDragOver] = useState(false);
+
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Simple validation to ensure drag is actually leaving the container
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (rect) {
+      if (
+        e.clientX < rect.left ||
+        e.clientX >= rect.right ||
+        e.clientY < rect.top ||
+        e.clientY >= rect.bottom
+      ) {
+        setIsDragOver(false);
+      }
+    } else {
+      setIsDragOver(false);
+    }
+  }, []);
+
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+
+    if (!e.dataTransfer || !e.dataTransfer.files) return;
+
+    const files = Array.from(e.dataTransfer.files) as File[];
+    if (files.length === 0) return;
+
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    // Calculate canvas drop coordinates
+    const dropClientX = e.clientX;
+    const dropClientY = e.clientY;
+    const dropCanvasX = (dropClientX - tx.get()) / tScale.get();
+    const dropCanvasY = (dropClientY - ty.get()) / tScale.get();
+
+    // Process files in parallel to read natural dimensions
+    const cardPromises = files.map(async (file, index) => {
+      const isImage = file.type.startsWith('image/');
+      const isVideo = file.type.startsWith('video/');
+
+      if (!isImage && !isVideo) return null;
+
+      let processedFile: Blob = file;
+      let originalFileData: Blob | undefined = undefined;
+      let trueOriginalFileData: Blob | undefined = undefined;
+      let originalImageUrl: string | undefined = undefined;
+      let trueOriginalImageUrl: string | undefined = undefined;
+
+      let width = 0;
+      let height = 0;
+
+      if (isImage) {
+        try {
+          const originalDims = await getImageDimensions(URL.createObjectURL(file));
+          width = originalDims.width;
+          height = originalDims.height;
+          
+          // Generate 1200px preview
+          processedFile = await compressAndResizeImage(file, 1200);
+          
+          // Check if original is > 4K (using 3840 as 4K edge)
+          const MAX_4K_DIM = 3840;
+          if (width > MAX_4K_DIM || height > MAX_4K_DIM) {
+            trueOriginalFileData = file;
+            trueOriginalImageUrl = URL.createObjectURL(file);
+            
+            // Create a 4K proxy for the "original" view in the UI
+            originalFileData = await compressAndResizeImage(file, MAX_4K_DIM, 0.9);
+            originalImageUrl = URL.createObjectURL(originalFileData);
+          } else {
+            // It's under 4K, so the original file is the 4K proxy itself
+            originalFileData = file;
+            originalImageUrl = URL.createObjectURL(file);
+          }
+        } catch (err) {
+          console.error("Failed to read image dimensions", err);
+          processedFile = await compressAndResizeImage(file, 1200);
+          originalFileData = file;
+          originalImageUrl = URL.createObjectURL(file);
+        }
+      } else if (isVideo) {
+        try {
+          const dims = await getVideoDimensions(URL.createObjectURL(file));
+          width = dims.width;
+          height = dims.height;
+        } catch (err) {
+          console.error("Failed to read video dimensions", err);
+        }
+      }
+
+      const fileUrl = URL.createObjectURL(processedFile);
+      const newId = Math.random().toString(36).substring(2, 11);
+      const offset = index * 40;
+
+      // Default aspect ratio if mapping fails
+      const ratio = getClosestAspectRatio(width, height);
+      const dim = CARD_DIMENSIONS[ratio];
+
+      let thumbnailUrl: string | undefined;
+      try {
+        if (isVideo) {
+          thumbnailUrl = await generateVideoThumbnail(processedFile, MAX_THUMBNAIL_EDGE);
+        } else {
+          thumbnailUrl = await generateImageThumbnail(processedFile, MAX_THUMBNAIL_EDGE);
+        }
+      } catch (thumbErr) {
+        console.warn('Could not pre-generate thumbnail on drop:', thumbErr);
+      }
+
+      const card: CardData = {
+        id: newId,
+        x: dropCanvasX - dim.width / 2 + offset,
+        y: dropCanvasY - dim.height / 2 + offset,
+        state: 'completed',
+        ratio: ratio,
+        res: '2K',
+        prompt: `Dropped local ${isVideo ? 'video' : 'image'}: ${file.name}`,
+        imageUrl: fileUrl,
+        isVideo: isVideo,
+        fileData: processedFile,
+        originalFileData: originalFileData,
+        trueOriginalFileData: trueOriginalFileData,
+        originalImageUrl: originalImageUrl,
+        trueOriginalImageUrl: trueOriginalImageUrl,
+        thumbnailUrl: thumbnailUrl,
+      };
+
+      return card;
+    });
+
+    const results = await Promise.all(cardPromises);
+    const validCards = results.filter((c): c is CardData => c !== null);
+
+    if (validCards.length > 0) {
+      setCards(prev => [...prev, ...validCards]);
+      setSelectedCardIds(validCards.map(c => c.id));
+    }
+  }, [tx, ty, tScale]);
 
   // --- Canvas Transform Project Sync ---
   // Load canvas transform per project
@@ -575,8 +840,37 @@ export default function App() {
         if (!mounted) return;
         
         if (saved && saved.length > 0) {
-          setHistory({ past: [], present: saved, future: [] });
+          const processedSaved = saved.map(card => {
+            const updates: any = {};
+            if (card.fileData) {
+              updates.imageUrl = URL.createObjectURL(card.fileData);
+            }
+            if (card.originalFileData) {
+              updates.originalImageUrl = URL.createObjectURL(card.originalFileData);
+            }
+            if (card.trueOriginalFileData) {
+              updates.trueOriginalImageUrl = URL.createObjectURL(card.trueOriginalFileData);
+            }
+            return {
+              ...card,
+              ...updates
+            };
+          });
+          setHistory({ past: [], present: processedSaved, future: [] });
           loadedProjectIdRef.current = currentProjectId;
+
+          // Asynchronously pre-generate 64px thumbnails for historical cards missing them
+          setTimeout(() => {
+            if (!mounted) return;
+            processedSaved.forEach(async (card) => {
+              if (!card.thumbnailUrl && (card.fileData || card.imageUrl || card.originalImageUrl)) {
+                const thumb = await getOrCreateMediaThumbnail(card);
+                if (thumb && mounted) {
+                  setCards(prev => prev.map(c => c.id === card.id ? { ...c, thumbnailUrl: thumb } : c), false);
+                }
+              }
+            });
+          }, 300);
         } else {
           // If this is the default project, check if legacy un-scoped cards exist first
           let fallbackCards: CardData[] | null = null;
@@ -584,8 +878,24 @@ export default function App() {
             fallbackCards = await loadCards(); // legacy un-scoped key
           }
           if (fallbackCards && fallbackCards.length > 0) {
-            setHistory({ past: [], present: fallbackCards, future: [] });
-            await saveCards(fallbackCards, currentProjectId).catch(console.error);
+            const processedFallback = fallbackCards.map(card => {
+              const updates: any = {};
+              if (card.fileData) {
+                updates.imageUrl = URL.createObjectURL(card.fileData);
+              }
+              if (card.originalFileData) {
+                updates.originalImageUrl = URL.createObjectURL(card.originalFileData);
+              }
+              if (card.trueOriginalFileData) {
+                updates.trueOriginalImageUrl = URL.createObjectURL(card.trueOriginalFileData);
+              }
+              return {
+                ...card,
+                ...updates
+              };
+            });
+            setHistory({ past: [], present: processedFallback, future: [] });
+            await saveCards(processedFallback, currentProjectId).catch(console.error);
           } else {
             const initialCards: CardData[] = [{
               id: `card_${Date.now()}_1`,
@@ -709,16 +1019,45 @@ export default function App() {
     };
   }, [tx, ty, tScale, updateCircularCulling]);
 
-  // Micro-LOD state tracking (scale < 0.25)
-  const [isMicroLod, setIsMicroLod] = useState(() => tScale.get() < 0.25);
+  // Micro-LOD state tracking (scale < 0.60)
+  const [isMicroLod, setIsMicroLod] = useState(() => tScale.get() < 0.60);
+  // Nano-LOD state tracking (scale < 0.60)
+  const [isNanoLod, setIsNanoLod] = useState(() => tScale.get() < 0.60);
+  // Extended Nano-LOD state to act as a backend backdrop during DOM card fade-in
+  const [isNanoCanvasActive, setIsNanoCanvasActive] = useState(() => tScale.get() < 0.60);
+  // Extended DOM card state to act as a frontend backdrop while Canvas prepares to render
+  const [isDomCardsActive, setIsDomCardsActive] = useState(() => tScale.get() >= 0.60);
+
+  const handleNanoCanvasReady = useCallback(() => {
+    if (isNanoLod) {
+      setIsDomCardsActive(false);
+    }
+  }, [isNanoLod]);
+
+  useEffect(() => {
+    if (isNanoLod) {
+      setIsNanoCanvasActive(true);
+      // isDomCardsActive will be disabled by the onReady callback from NanoLodCanvas once its first frame renders
+    } else {
+      setIsDomCardsActive(true);
+      // Give DOM cards a brief window to mount and paint before destroying the backdrop Canvas
+      const t = setTimeout(() => setIsNanoCanvasActive(false), 150);
+      return () => clearTimeout(t);
+    }
+  }, [isNanoLod]);
 
   useEffect(() => {
     const unsub = tScale.on('change', (s) => {
-      const isMicro = s < 0.25;
-      setIsMicroLod(prev => (prev !== isMicro ? isMicro : prev));
+      const isMicro = s < 0.60;
+      const isNano = s < 0.60;
+      
+      setIsMicroLod(isMicro);
+      setIsNanoLod(isNano);
     });
     return unsub;
   }, [tScale]);
+
+  const [maxDOMCardsAllowed, setMaxDOMCardsAllowed] = useState(Infinity);
 
   const handleCardDrag = useCallback((id: string, dx: number, dy: number) => {
     // No-op. Real-time dragging is now fully handled in DOM by GenerationCard.tsx (Master-Slave architecture).
@@ -865,7 +1204,20 @@ export default function App() {
     const canvasY = (cursorY - ty.get()) / tScale.get();
     
     const cardElement = (e.target as Element).closest('[data-card-id]');
-    const targetId = cardElement ? cardElement.getAttribute('data-card-id') : null;
+    let targetId = cardElement ? cardElement.getAttribute('data-card-id') : null;
+    
+    // In Nano-LOD mode, cards are rendered via Hybrid Canvas (no DOM data-card-id).
+    // Perform instant world-coordinate hit-testing to identify the target card.
+    if (!targetId && isNanoLod) {
+      for (let i = cards.length - 1; i >= 0; i--) {
+        const c = cards[i];
+        const dim = CARD_DIMENSIONS[c.ratio] || { width: 480, height: 480 };
+        if (canvasX >= c.x && canvasX <= c.x + dim.width && canvasY >= c.y && canvasY <= c.y + dim.height) {
+          targetId = c.id;
+          break;
+        }
+      }
+    }
     
     if (targetId && !selectedCardIds.includes(targetId)) {
       setSelectedCardIds([targetId]);
@@ -1658,12 +2010,18 @@ export default function App() {
     // Garbage Collection / Mount Trigger: Update circular culling bounds
     updateCircularCulling();
     
+    // Restore accurate LOD states now that the user has stopped zooming or dragging
+    const currentScale = tScale.get();
+    setIsMicroLod(currentScale < 0.60);
+    setIsNanoLod(currentScale < 0.60);
+    
     const workspace = document.getElementById('canvas-workspace');
     if (workspace) {
       if (workspace.getAttribute('data-zooming') === 'true') {
         // 2. Bypass transition storm: Instantly restore styles without CSS interpolation (Fixes end stutter)
         workspace.style.transition = 'none';
         workspace.setAttribute('data-zooming', 'false');
+        isZoomingRef.current = false;
         setIsZooming(false); // MUST sync React state so it doesn't revert on next render
         void workspace.offsetHeight;
         requestAnimationFrame(() => {
@@ -1671,16 +2029,66 @@ export default function App() {
         });
       }
     }
-  }, [updateCircularCulling]);
+  }, [updateCircularCulling, tScale]);
 
   useEffect(() => {
     (window as any).resetGlobalZoomTimer = () => {
       clearTimeout(zoomTimeoutRef.current);
-      const idleDelay = tScale.get() >= 0.8 ? 150 : 2000;
+      const idleDelay = tScale.get() >= 0.60 ? 150 : 2000;
       zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, idleDelay);
     };
     return () => { delete (window as any).resetGlobalZoomTimer; };
   }, [restoreCanvasStyles, tScale]);
+
+  const animateZoomTo = useCallback((newScale: number) => {
+    const prevScale = tScale.get();
+    if (Math.abs(prevScale - newScale) < 0.001) return;
+    
+    // 1. Degrade styles during active animation to keep frames buttery smooth (Intent-Driven Lazy Restoration)
+    const workspace = document.getElementById('canvas-workspace');
+    if (workspace && workspace.getAttribute('data-zooming') !== 'true') {
+      workspace.setAttribute('data-zooming', 'true');
+      isZoomingRef.current = true;
+      setIsZooming(true);
+    }
+    
+    // 2. Clear previous restoration timers
+    clearTimeout(zoomTimeoutRef.current);
+    
+    // 3. Set restoration timer based on target scale
+    const idleDelay = newScale >= 0.60 ? 150 : 2000;
+    zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, idleDelay);
+
+    // 4. Calculate coordinate transition zooming toward center of screen
+    const centerX = window.innerWidth / 2;
+    const centerY = window.innerHeight / 2;
+    const scaleRatio = newScale / prevScale;
+    
+    const newX = centerX - (centerX - tx.get()) * scaleRatio;
+    const newY = centerY - (centerY - ty.get()) * scaleRatio;
+    
+    targetTransform.current = { x: newX, y: newY, scale: newScale };
+    
+    animate(tScale, newScale, { type: 'tween', duration: 0.22, ease: 'easeOut' });
+    animate(tx, newX, { type: 'tween', duration: 0.22, ease: 'easeOut' });
+    animate(ty, newY, { type: 'tween', duration: 0.22, ease: 'easeOut' });
+  }, [tScale, tx, ty, restoreCanvasStyles]);
+
+  const handleZoomIn = useCallback(() => {
+    const prevScale = tScale.get();
+    const newScale = Math.min(prevScale * 1.2, 5);
+    animateZoomTo(newScale);
+  }, [tScale, animateZoomTo]);
+
+  const handleZoomOut = useCallback(() => {
+    const prevScale = tScale.get();
+    const newScale = Math.max(prevScale / 1.2, 0.1);
+    animateZoomTo(newScale);
+  }, [tScale, animateZoomTo]);
+
+  const handleZoomReset = useCallback(() => {
+    animateZoomTo(1);
+  }, [animateZoomTo]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -1717,6 +2125,7 @@ export default function App() {
       if (workspace && workspace.getAttribute('data-zooming') !== 'true') {
         workspace.setAttribute('data-zooming', 'true');
         // We also sync the React state so it doesn't fight us later
+        isZoomingRef.current = true;
         setIsZooming(true);
       }
 
@@ -1730,9 +2139,9 @@ export default function App() {
       const newScale = Math.min(Math.max(0.1, prevTarget.scale * Math.exp(delta)), 5);
       
       // 3. LOD Rasterization Strategy:
-      // If zoomed in (scale >= 0.8), few cards are visible. Restore quickly (150ms) for crisp text.
-      // If zoomed out (scale < 0.8), many cards are visible. Restore slowly (2000ms) to prevent massive reflow stutters.
-      const idleDelay = newScale >= 0.8 ? 150 : 2000;
+      // If zoomed in (scale >= 0.60), restore quickly (150ms) for crisp text.
+      // If zoomed out (scale < 0.60), restore slowly (2000ms) to prevent massive reflow stutters.
+      const idleDelay = newScale >= 0.60 ? 150 : 2000;
       zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, idleDelay);
       
       const rect = container.getBoundingClientRect();
@@ -1762,14 +2171,50 @@ export default function App() {
 
   const onPointerDown = (e: React.PointerEvent) => {
     if (e.button === 0) {
-      if (e.target === containerRef.current || (e.target as Element).id === 'grid-bg-overlay') {
-        if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
-          setSelectedCardIds([]);
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect) {
+        const cursorX = e.clientX - rect.left;
+        const cursorY = e.clientY - rect.top;
+        const canvasX = (cursorX - tx.get()) / tScale.get();
+        const canvasY = (cursorY - ty.get()) / tScale.get();
+
+        // In Nano-LOD mode, DOM cards are unmounted for 60fps performance.
+        // Hit-test against pure world coordinates to select or drag cards:
+        if (isNanoLod) {
+          let clickedCard: CardData | undefined;
+          for (let i = cards.length - 1; i >= 0; i--) {
+            const c = cards[i];
+            const dim = CARD_DIMENSIONS[c.ratio] || { width: 480, height: 480 };
+            if (canvasX >= c.x && canvasX <= c.x + dim.width && canvasY >= c.y && canvasY <= c.y + dim.height) {
+              clickedCard = c;
+              break;
+            }
+          }
+
+          if (clickedCard) {
+            handleCardSelect(e, clickedCard.id);
+            nanoDragRef.current = {
+              cardId: clickedCard.id,
+              startX: e.clientX,
+              startY: e.clientY,
+              didMove: false,
+              initialCards: cards.map(c => ({ id: c.id, x: c.x, y: c.y })),
+            };
+            containerRef.current?.setPointerCapture(e.pointerId);
+            return;
+          }
         }
-        const rect = containerRef.current?.getBoundingClientRect();
-        if (rect) {
-          const canvasX = (e.clientX - tx.get()) / tScale.get();
-          const canvasY = (e.clientY - ty.get()) / tScale.get();
+
+        const isBackgroundTarget = 
+          e.target === containerRef.current || 
+          (e.target as Element).id === 'grid-bg-overlay' || 
+          (e.target as Element).id === 'nano-lod-canvas' ||
+          (e.target as Element).id === 'canvas-workspace';
+
+        if (isBackgroundTarget) {
+          if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
+            setSelectedCardIds([]);
+          }
           setSelectionBox({
             startX: canvasX,
             startY: canvasY,
@@ -1813,6 +2258,27 @@ export default function App() {
       
       tx.set(newX);
       ty.set(newY);
+    } else if (nanoDragRef.current) {
+      const currentScale = tScale.get();
+      const dx = (e.clientX - nanoDragRef.current.startX) / currentScale;
+      const dy = (e.clientY - nanoDragRef.current.startY) / currentScale;
+      if (Math.hypot(e.clientX - nanoDragRef.current.startX, e.clientY - nanoDragRef.current.startY) > 3) {
+        nanoDragRef.current.didMove = true;
+      }
+      if (nanoDragRef.current.didMove) {
+        const draggingId = nanoDragRef.current.cardId;
+        const isDraggingSelected = selectedCardIdsRef.current.includes(draggingId);
+        const initMap = new Map<string, { id: string; x: number; y: number }>(
+          nanoDragRef.current.initialCards.map(c => [c.id, c])
+        );
+        setCards(prev => prev.map(c => {
+          if (isDraggingSelected ? selectedCardIdsRef.current.includes(c.id) : c.id === draggingId) {
+            const init = initMap.get(c.id);
+            if (init) return { ...c, x: init.x + dx, y: init.y + dy };
+          }
+          return c;
+        }), false);
+      }
     } else if (selectionBox) {
       const canvasX = (e.clientX - tx.get()) / tScale.get();
       const canvasY = (e.clientY - ty.get()) / tScale.get();
@@ -1846,12 +2312,20 @@ export default function App() {
     isDraggingCanvasRef.current = false;
     document.body.style.cursor = 'default';
     
+    if (nanoDragRef.current) {
+      if (nanoDragRef.current.didMove) {
+        // Record moved cards into history on pointer release
+        setCards(prev => [...prev], true);
+      }
+      nanoDragRef.current = null;
+    }
+
     // Instead of forcing a restore immediately after a middle-click drag,
     // we assume the user might drag or zoom again very soon.
     // So we reset the "idle" timer using our LOD Rasterization strategy.
     if (e.button === 1) {
       clearTimeout(zoomTimeoutRef.current);
-      const idleDelay = tScale.get() >= 0.8 ? 150 : 2000;
+      const idleDelay = tScale.get() >= 0.60 ? 150 : 2000;
       zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, idleDelay);
     }
     
@@ -1865,6 +2339,13 @@ export default function App() {
       restoreCanvasStyles();
     }
   }, [showSettings, isScriptDrawerOpen, restoreCanvasStyles]);
+
+  useEffect(() => {
+    // INTENT SIGNAL: Selecting nodes indicates active inspection or editing intent.
+    if (selectedCardIds.length > 0) {
+      restoreCanvasStyles();
+    }
+  }, [selectedCardIds, restoreCanvasStyles]);
 
   const visibleCards = useMemo(() => {
     // If visibleCardIdSet has not yet initialized, calculate directly for first frame
@@ -1883,6 +2364,67 @@ export default function App() {
     }
     return cards.filter(card => visibleCardIdSet.has(card.id));
   }, [cards, visibleCardIdSet, selectedCardIds, tx, ty, tScale]);
+
+  // Effect: Increase maxDOMCardsAllowed frame-by-frame when transitioning from Nano-LOD to Micro-LOD
+  useEffect(() => {
+    if (!isDomCardsActive) {
+      setMaxDOMCardsAllowed(0);
+      return;
+    }
+
+    // Reset and step load starting at 3 cards
+    let currentLimit = 3;
+    setMaxDOMCardsAllowed(currentLimit);
+
+    let rafId: number;
+    const step = () => {
+      currentLimit += 3;
+      if (currentLimit >= cards.length + 10) {
+        // Stagger finished, allow unlimited mounting for 100% performance efficiency
+        setMaxDOMCardsAllowed(Infinity);
+        return;
+      }
+      setMaxDOMCardsAllowed(currentLimit);
+      rafId = requestAnimationFrame(step);
+    };
+
+    rafId = requestAnimationFrame(step);
+    return () => {
+      cancelAnimationFrame(rafId);
+    };
+  }, [isDomCardsActive, cards.length]);
+
+  // Pure computed view representing exact, frame-perfect sorted nodes to mount
+  const renderedCardIds = useMemo(() => {
+    if (!isDomCardsActive) return new Set<string>();
+
+    if (maxDOMCardsAllowed === Infinity) {
+      return new Set(visibleCards.map(c => c.id));
+    }
+
+    // Sort visible cards by exact center distance using precise dynamic card dimensions
+    const scaleVal = tScale.get() || 1;
+    const centerX = (window.innerWidth / 2 - tx.get()) / scaleVal;
+    const centerY = (window.innerHeight / 2 - ty.get()) / scaleVal;
+
+    const sortedCards = [...visibleCards].sort((a, b) => {
+      const aSel = selectedCardIdsRef.current.includes(a.id);
+      const bSel = selectedCardIdsRef.current.includes(b.id);
+      if (aSel && !bSel) return -1;
+      if (!aSel && bSel) return 1;
+
+      // Real dimensions from actual aspect ratios
+      const dimA = CARD_DIMENSIONS[a.ratio] || { width: 480, height: 480 };
+      const dimB = CARD_DIMENSIONS[b.ratio] || { width: 480, height: 480 };
+
+      const distA = Math.pow((a.x + dimA.width / 2) - centerX, 2) + Math.pow((a.y + dimA.height / 2) - centerY, 2);
+      const distB = Math.pow((b.x + dimB.width / 2) - centerX, 2) + Math.pow((b.y + dimB.height / 2) - centerY, 2);
+      return distA - distB;
+    });
+
+    const allowedIds = sortedCards.slice(0, maxDOMCardsAllowed).map(c => c.id);
+    return new Set(allowedIds);
+  }, [isDomCardsActive, maxDOMCardsAllowed, visibleCards, tx, ty, tScale]);
 
   return (
     <div 
@@ -1905,7 +2447,33 @@ export default function App() {
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
       onContextMenu={handleContextMenu}
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
     >
+      {/* Local Drag and Drop Overlay */}
+      <AnimatePresence>
+        {isDragOver && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            className="absolute inset-0 z-40 bg-blue-500/10 dark:bg-blue-500/5 backdrop-blur-[2px] pointer-events-none flex items-center justify-center border-4 border-dashed border-blue-500/40 m-4 rounded-[28px]"
+          >
+            <div className="flex flex-col items-center gap-3 p-8 rounded-[24px] bg-white/90 dark:bg-neutral-900/90 shadow-2xl border border-gray-200/50 dark:border-neutral-700/50 scale-100 max-w-sm text-center">
+              <div className="w-16 h-16 rounded-2xl bg-blue-50 dark:bg-blue-900/20 flex items-center justify-center text-blue-500 dark:text-blue-400">
+                <Plus className="w-8 h-8 animate-bounce" />
+              </div>
+              <h3 className="text-base font-semibold text-gray-900 dark:text-white">放置媒体文件到画布</h3>
+              <p className="text-xs text-gray-500 dark:text-neutral-400 leading-relaxed">
+                支持直接拖拽一个或多个本地图片、视频文件。松开即可自动创建画布卡片。
+              </p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
       {/* Unified Project & Script Bible Hub */}
       <ProjectScriptBible
         currentProject={currentProject}
@@ -1985,32 +2553,50 @@ export default function App() {
         className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[100vw] h-[100vw] rounded-full border border-dashed border-blue-500/40 dark:border-blue-400/35 pointer-events-none z-0"
       />
 
+      {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.60 or during staggered DOM loading) */}
+      <NanoLodCanvas
+        cards={cards}
+        selectedCardIds={selectedCardIds}
+        scale={tScale}
+        tx={tx}
+        ty={ty}
+        isDarkMode={isDarkMode}
+        isActive={isNanoCanvasActive || (renderedCardIds.size < visibleCards.length && visibleCards.length > 0)}
+        onReady={handleNanoCanvasReady}
+        onThumbnailGenerated={(id, thumbnailUrl) => {
+          handleUpdateCard(id, { thumbnailUrl }, false);
+        }}
+      />
+
       {/* Canvas Workspace for Nodes/Cards */}
       <motion.div 
         id="canvas-workspace"
         className={`absolute top-0 left-0 transform-gpu group/canvas z-0 ${isZooming || isDraggingCanvasRef.current ? 'will-change-transform' : ''}`}
         data-zooming={isZooming}
         data-scale-micro={isMicroLod}
+        data-scale-nano={isNanoLod}
         style={{ transformOrigin: '0 0', x: tx, y: ty, scale: tScale }}
       >
 
-        {/* Canvas Items */}
-        {visibleCards.map(card => (
-          <GenerationCard 
-            key={card.id}
-            data={card}
-            scale={tScale}
-            tx={tx}
-            ty={ty}
-            isMicroLod={isMicroLod}
-            isSelected={selectedCardIds.includes(card.id)}
-            onSelect={handleCardSelect}
-            onDrag={handleCardDrag}
-            onDragEnd={handleCardDragEnd}
-            onDelete={handleCardDelete}
-            onUpdate={handleUpdateCard}
-          />
-        ))}
+        {/* Canvas Items: In Nano-LOD mode (scale < 0.60), unmount all DOM cards for ultra-fast Hybrid Canvas rendering */}
+        {isDomCardsActive && visibleCards.map(card => {
+          if (!renderedCardIds.has(card.id)) return null;
+          return (
+            <GenerationCard 
+              key={card.id}
+              data={card}
+              scale={tScale}
+              tx={tx}
+              ty={ty}
+              isSelected={selectedCardIds.includes(card.id)}
+              onSelect={handleCardSelect}
+              onDrag={handleCardDrag}
+              onDragEnd={handleCardDragEnd}
+              onDelete={handleCardDelete}
+              onUpdate={handleUpdateCard}
+            />
+          );
+        })}
 
         {/* Selection Box */}
         {selectionBox && (
@@ -2294,6 +2880,38 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Bottom Left Scale Indicator HUD */}
+      <div 
+        className="fixed bottom-6 left-6 z-50 flex items-center bg-gray-100/90 dark:bg-neutral-800/90 backdrop-blur-md border border-gray-200/80 dark:border-[#404040]/80 shadow-md rounded-[20px] corner-squircle p-1.5 gap-1 select-none"
+        onPointerDown={e => e.stopPropagation()}
+      >
+        <button
+          onClick={handleZoomOut}
+          disabled={zoomScale <= 0.101}
+          className="p-1.5 rounded-xl corner-squircle hover:bg-gray-200 dark:hover:bg-neutral-700 disabled:opacity-40 transition-colors"
+          title="缩小"
+        >
+          <Minus className="w-3.5 h-3.5 text-gray-700 dark:text-neutral-300" />
+        </button>
+        
+        <button
+          onClick={handleZoomReset}
+          className="px-2 py-1 rounded-xl corner-squircle hover:bg-gray-200 dark:hover:bg-neutral-700 transition-colors text-[11px] font-bold font-mono text-gray-800 dark:text-neutral-200 min-w-[54px] text-center"
+          title="重置到 100%"
+        >
+          {Math.round(zoomScale * 100)}%
+        </button>
+
+        <button
+          onClick={handleZoomIn}
+          disabled={zoomScale >= 4.99}
+          className="p-1.5 rounded-xl corner-squircle hover:bg-gray-200 dark:hover:bg-neutral-700 disabled:opacity-40 transition-colors"
+          title="放大"
+        >
+          <Plus className="w-3.5 h-3.5 text-gray-700 dark:text-neutral-300" />
+        </button>
+      </div>
 
       {/* Floating Toolbar */}
       <div 

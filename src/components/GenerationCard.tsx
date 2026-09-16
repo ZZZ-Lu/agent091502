@@ -8,6 +8,7 @@ import {
   Layers,
   Trash2
 } from 'lucide-react';
+import { isCardIntersectingCircle } from '../utils/viewportCulling';
 
 export type CardState = 'draft' | 'generating' | 'completed';
 export type AspectRatio = '1:1' | '3:4' | '9:16' | '16:9';
@@ -20,6 +21,25 @@ export const CARD_DIMENSIONS: Record<AspectRatio, { width: number, height: numbe
   '16:9': { width: 640, height: 360 }
 };
 
+const generateThumbnail = (video: HTMLVideoElement) => {
+  try {
+    const canvas = document.createElement('canvas');
+    const width = 256;
+    const aspect = video.videoHeight / video.videoWidth;
+    if (!aspect || !isFinite(aspect)) return undefined;
+    canvas.width = width;
+    canvas.height = width * aspect;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      return canvas.toDataURL('image/jpeg', 0.6);
+    }
+  } catch (e) {
+    // Ignore Cross-Origin errors
+  }
+  return undefined;
+};
+
 export interface CardData {
   id: string;
   x: number;
@@ -29,6 +49,14 @@ export interface CardData {
   res: Resolution;
   prompt: string;
   imageUrl: string | null;
+  isVideo?: boolean;
+  fileData?: Blob;
+  originalFileData?: Blob; // Up to 4K proxy
+  trueOriginalFileData?: Blob; // The actual original file if > 4K
+  originalImageUrl?: string | null;
+  trueOriginalImageUrl?: string | null;
+  currentTime?: number;
+  thumbnailUrl?: string;
 }
 
 export interface GenerationCardProps {
@@ -37,7 +65,6 @@ export interface GenerationCardProps {
   scale: MotionValue<number>;
   tx: MotionValue<number>;
   ty: MotionValue<number>;
-  isMicroLod?: boolean;
   isSelected?: boolean;
   onSelect?: (e: React.PointerEvent, id: string) => void;
   onDrag?: (id: string, dx: number, dy: number) => void;
@@ -51,7 +78,6 @@ export const GenerationCard = React.memo(function GenerationCard({
   scale, 
   tx, 
   ty, 
-  isMicroLod,
   isSelected, 
   onSelect, 
   onDrag, 
@@ -59,30 +85,103 @@ export const GenerationCard = React.memo(function GenerationCard({
   onDelete, 
   onUpdate 
 }: GenerationCardProps) {
-  const { id, x, y, state, ratio, res, prompt, imageUrl } = data;
+  const { id, x, y, state, ratio, res, prompt, imageUrl, isVideo, currentTime } = data;
   
   const [openMenu, setOpenMenu] = useState<{ type: 'ratio' | 'res', ownerId: string } | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [duration, setDuration] = useState(0);
   
   const cardRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const lastSavedTimeRef = useRef<number>(currentTime || 0);
   const menuContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Micro-LOD state tracking (scale < 0.25)
-  const [internalIsMicro, setInternalIsMicro] = useState(() => isMicroLod ?? (scale.get() < 0.25));
+  const formatTime = (seconds: number) => {
+    if (isNaN(seconds)) return "0:00";
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+  };
+
+  // Circle detection and scale tracking for original image swaps
+  const [isInCircle, setIsInCircle] = useState(false);
+  const [currentScale, setCurrentScale] = useState(() => scale.get());
+  const [showOriginal, setShowOriginal] = useState(() => {
+    const s = scale.get();
+    const vp = {
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+      scale: s,
+      tx: tx.get(),
+      ty: ty.get()
+    };
+    return s > 2.0 && isCardIntersectingCircle(data, vp) && !!data.originalImageUrl;
+  });
 
   useEffect(() => {
-    if (typeof isMicroLod === 'boolean') {
-      setInternalIsMicro(isMicroLod);
-      return;
-    }
-    const unsub = scale.on('change', (v) => {
-      const micro = v < 0.25;
-      setInternalIsMicro(prev => (prev !== micro ? micro : prev));
-    });
-    return unsub;
-  }, [scale, isMicroLod]);
+    let timeout: ReturnType<typeof setTimeout>;
 
-  const activeMicro = isMicroLod ?? internalIsMicro;
+    const checkState = () => {
+      const s = scale.get();
+      setCurrentScale(s);
+      
+      const xVal = tx.get();
+      const yVal = ty.get();
+      const vp = {
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+        scale: s,
+        tx: xVal,
+        ty: yVal
+      };
+      const inCircle = isCardIntersectingCircle(data, vp);
+      setIsInCircle(inCircle);
+
+      // Intent-driven lazy restoration: 
+      // Drop to low-res proxy instantly upon any motion to guarantee 60fps pan/zoom.
+      setShowOriginal(false);
+
+      clearTimeout(timeout);
+      timeout = setTimeout(() => {
+        setShowOriginal(s > 2.0 && inCircle && !!data.originalImageUrl);
+      }, 150);
+    };
+
+    checkState();
+
+    const unsubScale = scale.on('change', checkState);
+    const unsubTx = tx.on('change', checkState);
+    const unsubTy = ty.on('change', checkState);
+
+    window.addEventListener('resize', checkState);
+
+    return () => {
+      unsubScale();
+      unsubTx();
+      unsubTy();
+      clearTimeout(timeout);
+      window.removeEventListener('resize', checkState);
+    };
+  }, [scale, tx, ty, data]);
+
+  const dpr = showOriginal ? Math.min(currentScale, 3.5) : 1;
+  const w = CARD_DIMENSIONS[ratio].width;
+  const h = CARD_DIMENSIONS[ratio].height;
+  
+  const [isInitialMediaReady, setIsInitialMediaReady] = useState(!imageUrl);
+  const imgRef = useRef<HTMLImageElement>(null);
+  
+  useEffect(() => {
+    if (!imageUrl) {
+      setIsInitialMediaReady(true);
+    } else if (imgRef.current && imgRef.current.complete) {
+      setIsInitialMediaReady(true);
+    } else if (videoRef.current && videoRef.current.readyState >= 2) {
+      setIsInitialMediaReady(true);
+    }
+  }, [imageUrl]);
   
   useEffect(() => {
     if (textareaRef.current) {
@@ -238,42 +337,6 @@ export const GenerationCard = React.memo(function GenerationCard({
   const ratios: AspectRatio[] = ['1:1', '3:4', '9:16', '16:9'];
   const resolutions: Resolution[] = ['1K', '2K', '4K'];
 
-  // --- Micro-LOD Shell (scale < 0.25) ---
-  // When zoomed out to micro scale, eliminate all nested DOM nodes, SVGs, controls, and animations.
-  // Render only a single shell div with background and basic corner radius, keeping interaction and movement.
-  if (activeMicro) {
-    const dim = CARD_DIMENSIONS[ratio];
-    return (
-      <div 
-        ref={cardRef}
-        data-card-id={id}
-        data-micro-lod="true"
-        data-selected={isSelected ? 'true' : 'false'}
-        className={`absolute top-0 left-0 pointer-events-auto cursor-grab active:cursor-grabbing squircle rounded-2xl transition-colors duration-150 ${
-          isSelected 
-            ? 'outline outline-2 outline-[#3b82f6] border-transparent shadow-md -translate-y-1' 
-            : 'border border-gray-200/90 dark:border-[#404040]/90 shadow-[0_1px_2px_rgba(0,0,0,0.06),0_0_1px_rgba(0,0,0,0.08)] dark:shadow-[0_1px_2px_rgba(0,0,0,0.35)] translate-y-0'
-        } ${
-          imageUrl 
-            ? 'bg-cover bg-center bg-no-repeat bg-gray-100 dark:bg-neutral-800' 
-            : 'bg-gray-100 dark:bg-neutral-800'
-        }`}
-        style={{ 
-          transform: `translate(${x}px, ${y}px)`,
-          width: dim.width,
-          height: dim.height,
-          backgroundImage: imageUrl ? `url(${imageUrl})` : undefined,
-          outlineWidth: isSelected ? 'calc(2px / var(--current-scale, 1))' : '0px',
-        }}
-        onPointerDownCapture={handleContainerPointerDown}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={onPointerUp}
-      />
-    );
-  }
-
   return (
     <motion.div 
       ref={cardRef}
@@ -298,7 +361,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       >
         {/* Top Layer: Image Placeholder & Drag Handle */}
         <div 
-          className={`pointer-events-auto relative shrink-0 overflow-hidden cursor-grab active:cursor-grabbing bg-gray-100 dark:bg-neutral-800 squircle self-start ease-out group-data-[scale-micro=true]/canvas:!border-none group-data-[zooming=true]/canvas:!shadow-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform ${isSelected ? 'outline outline-[#3b82f6]' : 'outline-none'} ${
+          className={`pointer-events-auto relative shrink-0 overflow-hidden cursor-grab active:cursor-grabbing bg-gray-100 dark:bg-neutral-800 squircle self-start ease-out group-data-[zooming=true]/canvas:!shadow-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform ${isSelected ? 'outline outline-[#3b82f6]' : 'outline-none'} ${
             isSelected 
               ? 'border-transparent shadow-[0_20px_40px_-8px_rgba(0,0,0,0.2),0_12px_24px_-6px_rgba(0,0,0,0.12)] dark:shadow-[0_24px_48px_-8px_rgba(0,0,0,0.6)] -translate-y-1' 
               : 'border border-gray-200/90 dark:border-[#404040]/90 shadow-[0_1px_2px_rgba(0,0,0,0.06),0_0_1px_rgba(0,0,0,0.08)] dark:shadow-[0_1px_2px_rgba(0,0,0,0.35)] translate-y-0 hover:shadow-[0_3px_8px_rgba(0,0,0,0.08)] hover:border-gray-300 dark:hover:border-neutral-600'
@@ -306,9 +369,6 @@ export const GenerationCard = React.memo(function GenerationCard({
           style={{ 
             width: CARD_DIMENSIONS[ratio].width, 
             height: CARD_DIMENSIONS[ratio].height,
-            backgroundImage: imageUrl ? `url(${imageUrl})` : undefined,
-            backgroundSize: 'cover',
-            backgroundPosition: 'center',
             outlineWidth: isSelected ? 'calc(2px / var(--current-scale, 1))' : '0px',
             boxShadow: isSelected ? '0 20px 40px -8px rgba(0, 0, 0, 0.22)' : undefined,
             transitionProperty: 'box-shadow, transform, border-color, width, height',
@@ -321,7 +381,7 @@ export const GenerationCard = React.memo(function GenerationCard({
           onPointerCancel={onPointerUp}
         >
         {/* Empty State Placeholder (SVG matching user request) */}
-        <div className={`absolute inset-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-800 transition-opacity duration-500 ${!imageUrl ? 'opacity-100' : 'opacity-0'}`}>
+        <div className={`absolute inset-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-800 transition-opacity duration-500 ${!imageUrl ? 'opacity-100' : 'opacity-0'} group-data-[scale-micro=true]/canvas:!opacity-0`}>
           <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-gray-300 dark:text-neutral-600">
             {/* Star */}
             <path d="M8.5 2C8.8 4.5 10.5 6.2 13 6.5C10.5 6.8 8.8 8.5 8.5 11C8.2 8.5 6.5 6.8 4 6.5C6.5 6.2 8.2 4.5 8.5 2Z" fill="currentColor"/>
@@ -332,18 +392,264 @@ export const GenerationCard = React.memo(function GenerationCard({
           </svg>
         </div>
 
-        {/* Generated Image */}
+        {/* Generated Image or Video */}
         {imageUrl && (
-          <motion.img 
-            initial={{ opacity: 0 }}
-            animate={{ 
-              opacity: 1, 
-              filter: state === 'generating' ? 'blur(12px) brightness(0.95)' : 'blur(0px) brightness(1)' 
-            }}
-            src={imageUrl} 
-            className={`absolute inset-0 w-full h-full object-cover transition-all duration-700 pointer-events-none group-data-[zooming=true]/canvas:!filter-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform`}
-            alt="Artwork"
-          />
+          isVideo ? (
+            <div 
+              className="absolute inset-0 overflow-hidden squircle pointer-events-auto"
+              style={{
+                width: w * dpr,
+                height: h * dpr,
+                transform: dpr > 1 ? `scale(${1 / dpr})` : undefined,
+                transformOrigin: 'top left',
+                backgroundImage: data.thumbnailUrl ? `url(${data.thumbnailUrl})` : undefined,
+                backgroundSize: 'cover',
+                backgroundPosition: 'center',
+              }}
+            >
+              <div className="absolute inset-0 w-full h-full overflow-hidden squircle group/video pointer-events-auto">
+                <motion.video 
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  ref={videoRef}
+                  src={imageUrl} 
+                  loop 
+                  playsInline
+                  className="absolute inset-0 w-full h-full object-cover pointer-events-none transition-opacity duration-700"
+                  onLoadedMetadata={(e) => {
+                    const video = e.currentTarget;
+                    setDuration(video.duration || 0);
+                    if (currentTime !== undefined) {
+                      video.currentTime = currentTime;
+                      setProgress((currentTime / (video.duration || 1)) * 100);
+                    }
+                  }}
+                  onTimeUpdate={(e) => {
+                    const video = e.currentTarget;
+                    const currTime = video.currentTime;
+                    if (video.duration) {
+                      setProgress((currTime / video.duration) * 100);
+                    }
+                    if (Math.abs(currTime - lastSavedTimeRef.current) >= 1.5) {
+                      lastSavedTimeRef.current = currTime;
+                      const updates: Partial<CardData> = { currentTime: currTime };
+                      const thumbUrl = generateThumbnail(video);
+                      if (thumbUrl) updates.thumbnailUrl = thumbUrl;
+                      onUpdate(id, updates, false);
+                    }
+                  }}
+                  onPause={(e) => {
+                    const video = e.currentTarget;
+                    const thumbUrl = generateThumbnail(video);
+                    if (thumbUrl) {
+                      onUpdate(id, { thumbnailUrl: thumbUrl }, false);
+                    }
+                  }}
+                />
+                {!isPlaying ? (() => {
+                  const narrowerSide = Math.min(CARD_DIMENSIONS[ratio].width, CARD_DIMENSIONS[ratio].height);
+                  const playButtonDiameter = narrowerSide / 2;
+                  const playButtonIconSize = playButtonDiameter * 0.76;
+                  return (
+                    <div 
+                      className="absolute inset-0 flex items-center justify-center bg-black/25 hover:bg-black/35 transition-colors pointer-events-none group-data-[scale-micro=true]/canvas:bg-black/15 group-data-[scale-micro=true]/canvas:hover:bg-black/15"
+                    >
+                      <div 
+                        className="rounded-full bg-white/20 dark:bg-black/30 backdrop-blur-md border border-white/30 dark:border-white/10 shadow-xl flex items-center justify-center transform hover:scale-105 transition-transform cursor-pointer pointer-events-auto group-data-[scale-micro=true]/canvas:!scale-100"
+                        style={{
+                          width: playButtonDiameter,
+                          height: playButtonDiameter,
+                        }}
+                        onPointerDown={(e) => {
+                          // Prevent card drag only on left-click of play button, allow middle click to pan
+                          if (e.button === 0) {
+                            e.stopPropagation();
+                          }
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (videoRef.current) {
+                            videoRef.current.play();
+                            setIsPlaying(true);
+                          }
+                        }}
+                      >
+                        <svg 
+                          viewBox="0 0 24 24" 
+                          fill="currentColor" 
+                          xmlns="http://www.w3.org/2000/svg" 
+                          className="text-white/85"
+                          style={{
+                            width: playButtonIconSize,
+                            height: playButtonIconSize,
+                          }}
+                        >
+                          <path d="M8 6.5v11c0 .8.9 1.3 1.6.9l8.5-5.5a1 1 0 0 0 0-1.8L9.6 5.6c-.7-.4-1.6.1-1.6.9z"/>
+                        </svg>
+                      </div>
+                    </div>
+                  );
+                })() : (
+                  (() => {
+                    const narrowerSide = Math.min(CARD_DIMENSIONS[ratio].width, CARD_DIMENSIONS[ratio].height);
+                    const playButtonDiameter = narrowerSide / 2;
+                    const playButtonIconSize = playButtonDiameter * 0.76;
+                    return (
+                      <div 
+                        className="absolute inset-0 bg-transparent hover:bg-black/5 transition-all duration-200 flex items-center justify-center pointer-events-none"
+                      >
+                        <div 
+                          className="rounded-full bg-white/20 dark:bg-black/30 backdrop-blur-md border border-white/30 dark:border-white/10 shadow-xl flex items-center justify-center transform hover:scale-105 transition-transform duration-200 opacity-0 hover:opacity-100 cursor-pointer pointer-events-auto"
+                          style={{
+                            width: playButtonDiameter,
+                            height: playButtonDiameter,
+                          }}
+                          onPointerDown={(e) => {
+                            // Prevent card drag only on left-click, allow middle click to pan
+                            if (e.button === 0) {
+                              e.stopPropagation();
+                            }
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (videoRef.current) {
+                              videoRef.current.pause();
+                              setIsPlaying(false);
+                              const currTime = videoRef.current.currentTime;
+                              lastSavedTimeRef.current = currTime;
+                              onUpdate(id, { currentTime: currTime }, false);
+                            }
+                          }}
+                        >
+                          <svg 
+                            viewBox="0 0 24 24" 
+                            fill="currentColor" 
+                            xmlns="http://www.w3.org/2000/svg" 
+                            className="text-white/85"
+                            style={{
+                              width: playButtonIconSize,
+                              height: playButtonIconSize,
+                            }}
+                          >
+                            <rect x="6" y="4.5" width="4" height="15" rx="1.5" />
+                            <rect x="14" y="4.5" width="4" height="15" rx="1.5" />
+                          </svg>
+                        </div>
+                      </div>
+                    );
+                  })()
+                )}
+
+                {/* Progress Bar Controller Overlay */}
+                <div 
+                  className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent p-4 pt-12 flex flex-col gap-2 transition-opacity duration-200 opacity-0 group-hover/video:opacity-100 group-data-[scale-micro=true]/canvas:hidden"
+                  onPointerDown={(e) => {
+                    // Prevent card dragging when interacting with controls
+                    if (e.button === 0) {
+                      e.stopPropagation();
+                    }
+                  }}
+                >
+                  <div className="flex items-center gap-3">
+                    {/* Miniature Play/Pause Button */}
+                    <button
+                      type="button"
+                      className="text-white hover:text-blue-400 transition-colors cursor-pointer focus:outline-none flex-shrink-0"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (videoRef.current) {
+                          if (isPlaying) {
+                            videoRef.current.pause();
+                            setIsPlaying(false);
+                            const currTime = videoRef.current.currentTime;
+                            lastSavedTimeRef.current = currTime;
+                            onUpdate(id, { currentTime: currTime }, false);
+                          } else {
+                            videoRef.current.play();
+                            setIsPlaying(true);
+                          }
+                        }
+                      }}
+                    >
+                      {isPlaying ? (
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <path d="M6 19H10V5H6V19ZM14 5V19H18V5H14Z" fill="currentColor"/>
+                        </svg>
+                      ) : (
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <path d="M8 5V19L19 12L8 5Z" fill="currentColor"/>
+                        </svg>
+                      )}
+                    </button>
+
+                    {/* Range Slider */}
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      step="0.1"
+                      value={progress}
+                      onChange={(e) => {
+                        const pct = parseFloat(e.target.value);
+                        setProgress(pct);
+                        if (videoRef.current && duration) {
+                          const targetTime = (pct / 100) * duration;
+                          videoRef.current.currentTime = targetTime;
+                          lastSavedTimeRef.current = targetTime;
+                          onUpdate(id, { currentTime: targetTime }, false);
+                        }
+                      }}
+                      className="w-full h-1 bg-transparent rounded-lg appearance-none cursor-pointer accent-blue-500 focus:outline-none [&::-webkit-slider-runnable-track]:bg-white/20 [&::-webkit-slider-runnable-track]:h-1 [&::-webkit-slider-runnable-track]:rounded-lg [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-500 hover:[&::-webkit-slider-thumb]:scale-125 [&::-webkit-slider-thumb]:-translate-y-[4px]"
+                    />
+
+                    {/* Time Stamps */}
+                    <span className="text-[10px] font-mono text-white/90 select-none flex-shrink-0">
+                      {formatTime(videoRef.current?.currentTime || 0)} / {formatTime(duration)}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div 
+              className="absolute inset-0 overflow-hidden squircle pointer-events-none"
+              style={{
+                width: w * dpr,
+                height: h * dpr,
+                transform: dpr > 1 ? `scale(${1 / dpr})` : undefined,
+                transformOrigin: 'top left',
+                backgroundImage: data.thumbnailUrl ? `url(${data.thumbnailUrl})` : undefined,
+                backgroundSize: 'cover',
+                backgroundPosition: 'center',
+              }}
+            >
+              <motion.img 
+                ref={imgRef}
+                initial={{ opacity: 0 }}
+                animate={{ 
+                  opacity: 1, 
+                  filter: state === 'generating' ? 'blur(12px) brightness(0.95)' : 'blur(0px) brightness(1)' 
+                }}
+                src={imageUrl} 
+                className={`absolute inset-0 w-full h-full object-cover squircle transition-all duration-700 pointer-events-none group-data-[zooming=true]/canvas:!filter-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform`}
+                alt="Artwork"
+              />
+              
+              {showOriginal && data.originalImageUrl && (
+                <motion.img 
+                  initial={{ opacity: 0 }}
+                  animate={{ 
+                    opacity: 1, 
+                    filter: state === 'generating' ? 'blur(12px) brightness(0.95)' : 'blur(0px) brightness(1)' 
+                  }}
+                  transition={{ duration: 0.15 }}
+                  src={data.originalImageUrl} 
+                  className={`absolute inset-0 w-full h-full object-cover squircle transition-all duration-700 pointer-events-none group-data-[zooming=true]/canvas:hidden`}
+                  alt="Artwork High Res"
+                />
+              )}
+            </div>
+          )
         )}
 
         {/* Generating State Overlay */}
@@ -353,7 +659,11 @@ export const GenerationCard = React.memo(function GenerationCard({
               initial={{ opacity: 0 }} 
               animate={{ opacity: 1 }} 
               exit={{ opacity: 0 }}
-              className={`absolute inset-0 flex flex-col items-center justify-center bg-gray-100 pointer-events-none z-10 group-data-[zooming=true]/canvas:opacity-0 group-data-[zooming=true]/canvas:will-change-transform`}
+              onAnimationComplete={() => {
+                // Also unblock media ready if it's currently generating
+                setIsInitialMediaReady(true);
+              }}
+              className={`absolute inset-0 flex flex-col items-center justify-center bg-gray-100 pointer-events-none z-10 group-data-[zooming=true]/canvas:opacity-0 group-data-[zooming=true]/canvas:will-change-transform group-data-[scale-micro=true]/canvas:hidden`}
             >
               <RefreshCw className="w-8 h-8 text-purple-600 animate-spin mb-3 drop-shadow-sm" />
               <span className="text-xs text-purple-700 font-bold tracking-widest uppercase drop-shadow-sm">Rendering</span>
@@ -362,7 +672,8 @@ export const GenerationCard = React.memo(function GenerationCard({
         </AnimatePresence>
       </div>
 
-      {/* Bottom Layer: Light Panel */}
+      {/* Bottom Layer: Light Panel (Hidden for local uploaded images) */}
+      {!data.fileData && !data.originalFileData && (
       <div 
         className={`pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 squircle p-4 gap-2 w-[480px] border border-gray-200/80 dark:border-[#404040] cursor-default self-start ease-out group-data-[scale-micro=true]/canvas:!opacity-0 group-data-[scale-micro=true]/canvas:!pointer-events-none group-data-[zooming=true]/canvas:!shadow-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform ${
         state === 'completed' && !isSelected ? 'opacity-0 pointer-events-none' : 'opacity-100'
@@ -510,6 +821,7 @@ export const GenerationCard = React.memo(function GenerationCard({
           </button>
         </div>
       </div>
+      )}
       </motion.div>
     </motion.div>
   );
