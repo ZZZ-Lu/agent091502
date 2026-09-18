@@ -1,5 +1,4 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { createPortal } from 'react-dom';
 import { motion, AnimatePresence, MotionValue } from 'motion/react';
 import { 
   RefreshCw,
@@ -7,20 +6,10 @@ import {
   ChevronDown,
   ArrowUp,
   Layers,
-  Trash2,
-  Upload,
-  Sparkles,
-  LayoutGrid,
-  X,
-  Search,
-  Image as ImageIcon,
-  User,
-  MapPin,
-  Box
+  Trash2
 } from 'lucide-react';
 import { isCardIntersectingRectangle } from '../utils/viewportCulling';
 import { CardImageCanvas } from './CardImageCanvas';
-import { ScriptProject } from '../types/script';
 
 export type CardState = 'draft' | 'generating' | 'completed';
 export type AspectRatio = '1:1' | '3:4' | '9:16' | '16:9';
@@ -78,17 +67,6 @@ export interface CardData {
   thumbnailUrl?: string;
   customWidth?: number;
   customHeight?: number;
-  fileName?: string;
-  nativeWidth?: number;
-  nativeHeight?: number;
-  referenceImages?: Array<{
-    url: string;
-    name?: string;
-    fileData?: Blob;
-  }>;
-  referenceImageUrl?: string | null;
-  referenceImageName?: string;
-  referenceImageFileData?: Blob;
 }
 
 export interface GenerationCardProps {
@@ -99,12 +77,6 @@ export interface GenerationCardProps {
   ty: MotionValue<number>;
   isSelected?: boolean;
   isZooming?: boolean;
-  allCards?: CardData[];
-  currentProject?: ScriptProject;
-  isPickerTarget?: boolean;
-  isPickerSelectable?: boolean;
-  pickerSelectionIndex?: number;
-  onStartCanvasPicker?: (cardId: string) => void;
   onSelect?: (e: React.PointerEvent, id: string) => void;
   onDrag?: (id: string, dx: number, dy: number) => void;
   onDragEnd?: (id: string, totalDx: number, totalDy: number) => void;
@@ -119,32 +91,19 @@ export const GenerationCard = React.memo(function GenerationCard({
   ty, 
   isSelected, 
   isZooming,
-  allCards,
-  currentProject,
-  isPickerTarget,
-  isPickerSelectable,
-  pickerSelectionIndex,
-  onStartCanvasPicker,
   onSelect, 
   onDrag, 
   onDragEnd, 
-  onDelete,
+  onDelete, 
   onUpdate 
 }: GenerationCardProps) {
   const { id, x, y, state, ratio, res, prompt, imageUrl, isVideo, currentTime } = data;
   
-  const [openMenu, setOpenMenu] = useState<{ type: 'ratio' | 'res' | 'ref', ownerId: string } | null>(null);
+  const [openMenu, setOpenMenu] = useState<{ type: 'ratio' | 'res', ownerId: string } | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
   const [progress, setProgress] = useState(0);
   const [duration, setDuration] = useState(0);
-
-  // Reference Image States
-  const [showAssetPicker, setShowAssetPicker] = useState(false);
-  const [assetFilter, setAssetFilter] = useState<'all' | 'characters' | 'locations' | 'props'>('all');
-  const [assetSearch, setAssetSearch] = useState('');
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const refMenuContainerRef = useRef<HTMLDivElement>(null);
   
   const cardRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -193,10 +152,11 @@ export const GenerationCard = React.memo(function GenerationCard({
     return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
   };
 
-  // Scale tracking for original high-resolution image swap (only active at extreme zoom > 2.0)
+  // Circle detection and scale tracking for original image swaps
+  const [isInCircle, setIsInCircle] = useState(false);
+  const [currentScale, setCurrentScale] = useState(() => scale.get());
   const [showOriginal, setShowOriginal] = useState(() => {
     const s = scale.get();
-    if (s <= 2.0 || !data.originalImageUrl) return false;
     const vp = {
       viewportWidth: window.innerWidth,
       viewportHeight: window.innerHeight,
@@ -204,56 +164,56 @@ export const GenerationCard = React.memo(function GenerationCard({
       tx: tx.get(),
       ty: ty.get()
     };
-    return isCardIntersectingRectangle(data, vp);
+    return s > 2.0 && isCardIntersectingRectangle(data, vp) && !!data.originalImageUrl;
   });
-  const showOriginalRef = useRef(showOriginal);
-  showOriginalRef.current = showOriginal;
 
   useEffect(() => {
     let timeout: ReturnType<typeof setTimeout>;
 
-    const onMotion = () => {
-      // Intent-driven lazy degradation:
-      // If 4K original is currently visible, drop back to proxy immediately to save rasterization
-      if (showOriginalRef.current) {
-        setShowOriginal(false);
-      }
+    const checkState = () => {
+      const s = scale.get();
+      setCurrentScale(s);
+      
+      const xVal = tx.get();
+      const yVal = ty.get();
+      const vp = {
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+        scale: s,
+        tx: xVal,
+        ty: yVal
+      };
+      const inCircle = isCardIntersectingRectangle(data, vp);
+      setIsInCircle(inCircle);
 
-      // Debounced check: ONLY swap in 4K original if user is zoomed in past 2.0 and has idled for 300ms
+      // Intent-driven lazy restoration: 
+      // Drop to low-res proxy instantly upon any motion to guarantee 60fps pan/zoom.
+      setShowOriginal(false);
+
       clearTimeout(timeout);
       timeout = setTimeout(() => {
-        const s = scale.get();
-        if (s <= 2.0 || !data.originalImageUrl) return;
-
-        const vp = {
-          viewportWidth: window.innerWidth,
-          viewportHeight: window.innerHeight,
-          scale: s,
-          tx: tx.get(),
-          ty: ty.get()
-        };
-        if (isCardIntersectingRectangle(data, vp)) {
-          setShowOriginal(true);
-        }
+        setShowOriginal(s > 2.0 && inCircle && !!data.originalImageUrl);
       }, 300);
     };
 
-    const unsubScale = scale.on('change', onMotion);
-    const unsubTx = tx.on('change', onMotion);
-    const unsubTy = ty.on('change', onMotion);
+    checkState();
 
-    window.addEventListener('resize', onMotion);
+    const unsubScale = scale.on('change', checkState);
+    const unsubTx = tx.on('change', checkState);
+    const unsubTy = ty.on('change', checkState);
+
+    window.addEventListener('resize', checkState);
 
     return () => {
       unsubScale();
       unsubTx();
       unsubTy();
       clearTimeout(timeout);
-      window.removeEventListener('resize', onMotion);
+      window.removeEventListener('resize', checkState);
     };
   }, [scale, tx, ty, data]);
 
-  const dpr = showOriginal ? Math.min(scale.get(), 8.0) : 1;
+  const dpr = showOriginal ? Math.min(currentScale, 3.5) : 1;
   const { width: w, height: h } = getCardSize(data);
   
   useEffect(() => {
@@ -286,10 +246,7 @@ export const GenerationCard = React.memo(function GenerationCard({
 
   useEffect(() => {
     const closeMenu = (e: PointerEvent) => {
-      const target = e.target as Node;
-      const insideParamMenu = menuContainerRef.current && menuContainerRef.current.contains(target);
-      const insideRefMenu = refMenuContainerRef.current && refMenuContainerRef.current.contains(target);
-      if (!insideParamMenu && !insideRefMenu) {
+      if (menuContainerRef.current && !menuContainerRef.current.contains(e.target as Node)) {
         setOpenMenu(prev => {
           if (!prev) return null;
           // If a user clicks, don't close agent's menu
@@ -394,22 +351,10 @@ export const GenerationCard = React.memo(function GenerationCard({
       if (typeof (window as any).resetGlobalZoomTimer === 'function') {
         (window as any).resetGlobalZoomTimer();
       }
-      const movedDistance = Math.hypot(totalDx.current, totalDy.current);
-      if (movedDistance > 2) {
-        if (onDragEnd) {
-          onDragEnd(id, totalDx.current, totalDy.current);
-        } else {
-          onUpdate(id, { x: posRef.current.x, y: posRef.current.y }, true);
-        }
+      if (onDragEnd) {
+        onDragEnd(id, totalDx.current, totalDy.current);
       } else {
-        // Reset to exact original position if slight jitter happened without meaningful drag
-        posRef.current = { x, y };
-        if (cardRef.current) {
-          cardRef.current.style.transform = `translate(${x}px, ${y}px)`;
-        }
-        slaveNodesRef.current.forEach(slave => {
-          slave.el.style.transform = `translate(${slave.initialX}px, ${slave.initialY}px)`;
-        });
+        onUpdate(id, { x: posRef.current.x, y: posRef.current.y }, true);
       }
     }
     e.currentTarget.releasePointerCapture(e.pointerId);
@@ -422,21 +367,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     // At this step, we pretend to send the trueOriginalFileData to an AI pipeline.
     const generationPayload: any = { prompt: prompt.trim() };
     
-    // Normalize reference images
-    const effectiveRefImages = data.referenceImages && data.referenceImages.length > 0
-      ? data.referenceImages
-      : data.referenceImageUrl
-        ? [{ url: data.referenceImageUrl, name: data.referenceImageName, fileData: data.referenceImageFileData }]
-        : [];
-
-    if (effectiveRefImages.length > 0) {
-        generationPayload.referenceImages = effectiveRefImages;
-        generationPayload.referenceImage = effectiveRefImages[0].fileData || effectiveRefImages[0].url;
-    } else if (data.referenceImageFileData) {
-        generationPayload.referenceImage = data.referenceImageFileData;
-    } else if (data.referenceImageUrl) {
-        generationPayload.referenceImageUrl = data.referenceImageUrl;
-    } else if (data.trueOriginalFileData) {
+    if (data.trueOriginalFileData) {
         // High fidelity AI reference branch
         console.log("SENDING TRUE ORIGINAL DATA TO AI", data.trueOriginalFileData.size, "bytes");
         generationPayload.referenceImage = data.trueOriginalFileData;
@@ -459,141 +390,6 @@ export const GenerationCard = React.memo(function GenerationCard({
       });
     }, 2500);
   };
-
-  const handleLocalUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const objectUrl = URL.createObjectURL(file);
-    const prevRefs = data.referenceImages && data.referenceImages.length > 0
-      ? [...data.referenceImages]
-      : data.referenceImageUrl ? [{ url: data.referenceImageUrl, name: data.referenceImageName, fileData: data.referenceImageFileData }] : [];
-    onUpdate(id, {
-      referenceImages: [...prevRefs, { url: objectUrl, name: file.name, fileData: file }],
-      referenceImageUrl: objectUrl,
-      referenceImageFileData: file,
-      referenceImageName: prevRefs.length > 0 ? `参考图 (${prevRefs.length + 1})` : file.name
-    }, true);
-    e.target.value = '';
-    setOpenMenu(null);
-  };
-
-  const handleSelectAsset = (asset: { name: string; referenceImage?: string; description?: string }) => {
-    const prevRefs = data.referenceImages && data.referenceImages.length > 0
-      ? [...data.referenceImages]
-      : data.referenceImageUrl ? [{ url: data.referenceImageUrl, name: data.referenceImageName, fileData: data.referenceImageFileData }] : [];
-    const newRef = { url: asset.referenceImage || '', name: asset.name };
-    const updates: Partial<CardData> = {
-      referenceImages: newRef.url ? [...prevRefs, newRef] : prevRefs,
-      referenceImageUrl: newRef.url || data.referenceImageUrl || null,
-      referenceImageName: prevRefs.length > 0 ? `参考图 (${prevRefs.length + 1})` : asset.name,
-      referenceImageFileData: undefined
-    };
-    if (!prompt.trim() && asset.description) {
-      updates.prompt = asset.description;
-    }
-    onUpdate(id, updates, true);
-    setShowAssetPicker(false);
-  };
-
-  const removeReferenceImage = (indexToRemove: number) => {
-    const prevRefs = data.referenceImages && data.referenceImages.length > 0
-      ? [...data.referenceImages]
-      : data.referenceImageUrl ? [{ url: data.referenceImageUrl, name: data.referenceImageName, fileData: data.referenceImageFileData }] : [];
-    const updated = prevRefs.filter((_, idx) => idx !== indexToRemove);
-    if (updated.length === 0) {
-      onUpdate(id, {
-        referenceImages: [],
-        referenceImageUrl: null,
-        referenceImageFileData: undefined,
-        referenceImageName: undefined
-      }, true);
-    } else {
-      onUpdate(id, {
-        referenceImages: updated,
-        referenceImageUrl: updated[0].url,
-        referenceImageName: updated.length > 1 ? `参考图 (${updated.length})` : updated[0].name,
-        referenceImageFileData: updated[0].fileData
-      }, true);
-    }
-  };
-
-  // Asset list items
-  const characterItems = (currentProject?.characters || []).map(c => ({
-    id: `char-${c.id}`,
-    category: 'characters' as const,
-    categoryLabel: '角色',
-    name: c.name,
-    tag: c.role || '角色设定',
-    description: c.appearance || c.performanceNotes || '',
-    referenceImage: c.referenceImage
-  }));
-
-  const locationItems = (currentProject?.locations || []).map(l => ({
-    id: `loc-${l.id}`,
-    category: 'locations' as const,
-    categoryLabel: '场景',
-    name: l.name,
-    tag: `${l.type === 'INT' ? '内景' : '外景'}${l.timeOfDay ? ` · ${l.timeOfDay}` : ''}`,
-    description: l.atmosphere || l.visualDetails || '',
-    referenceImage: l.referenceImage
-  }));
-
-  const propItems = (currentProject?.props || []).map(p => ({
-    id: `prop-${p.id}`,
-    category: 'props' as const,
-    categoryLabel: '道具',
-    name: p.name,
-    tag: p.owner ? `归属: ${p.owner}` : '道具',
-    description: p.materialAndState || p.storySignificance || '',
-    referenceImage: p.referenceImage
-  }));
-
-  const allAssetItems = [...characterItems, ...locationItems, ...propItems];
-  const filteredAssets = allAssetItems.filter(item => {
-    const matchesFilter = assetFilter === 'all' || item.category === assetFilter;
-    const q = assetSearch.trim().toLowerCase();
-    const matchesSearch = !q || item.name.toLowerCase().includes(q) || item.tag.toLowerCase().includes(q) || item.description.toLowerCase().includes(q);
-    return matchesFilter && matchesSearch;
-  });
-
-  const canvasCandidates = (allCards || []).filter(c => 
-    c.id !== id && Boolean(c.imageUrl || c.originalImageUrl || c.thumbnailUrl)
-  );
-
-  // Normalized list of references for display
-  const refList = data.referenceImages && data.referenceImages.length > 0
-    ? data.referenceImages
-    : data.referenceImageUrl
-      ? [{ url: data.referenceImageUrl, name: data.referenceImageName, fileData: data.referenceImageFileData }]
-      : [];
-
-  let resolutionTag = '';
-  if (data.nativeWidth && data.nativeHeight) {
-    const maxDim = Math.max(data.nativeWidth, data.nativeHeight);
-    const minDim = Math.min(data.nativeWidth, data.nativeHeight);
-    if (data.isVideo) {
-      if (minDim >= 2160 || maxDim >= 3840) resolutionTag = '4K';
-      else if (minDim >= 1080) resolutionTag = '1080p';
-      else if (minDim >= 720) resolutionTag = '720p';
-      else resolutionTag = '480p';
-    } else {
-      if (maxDim >= 4000) resolutionTag = '4K+';
-      else if (maxDim >= 3840) resolutionTag = '4K';
-      else if (maxDim >= 2048) resolutionTag = '2K';
-      else resolutionTag = '1K';
-    }
-  } else {
-    // Fallback based on data.res
-    if (data.isVideo) {
-      if (data.res === '4K') resolutionTag = '4K';
-      else if (data.res === '2K') resolutionTag = '1080p';
-      else resolutionTag = '720p';
-    } else {
-      if (data.res === '4K') resolutionTag = '4K';
-      else if (data.res === '2K') resolutionTag = '2K';
-      else resolutionTag = '1K';
-    }
-  }
 
   const ratios: AspectRatio[] = ['1:1', '3:4', '9:16', '16:9'];
   const resolutions: Resolution[] = ['1K', '2K', '4K'];
@@ -622,41 +418,17 @@ export const GenerationCard = React.memo(function GenerationCard({
       >
         {/* Top Layer: Image Placeholder & Drag Handle */}
         <div 
-          className={`pointer-events-auto relative shrink-0 overflow-hidden cursor-grab active:cursor-grabbing bg-gray-100 dark:bg-neutral-800 squircle self-start ease-out group-data-[zooming=true]/canvas:!shadow-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform ${
-            pickerSelectionIndex && pickerSelectionIndex > 0
-              ? 'outline outline-[4px] outline-[#2563eb] shadow-[0_0_25px_rgba(37,99,235,0.7)] scale-[1.015]'
-              : isPickerTarget
-                ? 'outline outline-[#3b82f6]'
-                : isSelected
-                  ? 'outline outline-[#3b82f6]'
-                  : 'outline-none'
-          } ${
-            pickerSelectionIndex && pickerSelectionIndex > 0
-              ? 'translate-y-0'
-              : isSelected 
-                ? 'border-transparent shadow-[0_20px_40px_-8px_rgba(0,0,0,0.2),0_12px_24px_-6px_rgba(0,0,0,0.12)] dark:shadow-[0_24px_48px_-8px_rgba(0,0,0,0.6)] translate-y-0' 
-                : isPickerTarget
-                  ? 'border-transparent shadow-[0_20px_40px_-8px_rgba(0,0,0,0.2),0_12px_24px_-6px_rgba(0,0,0,0.12)] dark:shadow-[0_24px_48px_-8px_rgba(0,0,0,0.6)]'
-                  : isPickerSelectable
-                    ? 'border border-gray-300 dark:border-neutral-600 shadow-[0_1px_3px_rgba(0,0,0,0.1)] translate-y-0 hover:shadow-[0_8px_16px_rgba(59,130,246,0.25)] hover:border-blue-400 dark:hover:border-blue-400/80 hover:outline hover:outline-2 hover:outline-blue-400/50 cursor-pointer'
-                    : 'border border-gray-200/90 dark:border-[#404040]/90 shadow-[0_1px_2px_rgba(0,0,0,0.06),0_0_1px_rgba(0,0,0,0.08)] dark:shadow-[0_1px_2px_rgba(0,0,0,0.35)] translate-y-0 hover:shadow-[0_3px_8px_rgba(0,0,0,0.08)] hover:border-gray-300 dark:hover:border-neutral-600'
+          className={`pointer-events-auto relative shrink-0 overflow-hidden cursor-grab active:cursor-grabbing bg-gray-100 dark:bg-neutral-800 squircle self-start ease-out group-data-[zooming=true]/canvas:!shadow-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform ${isSelected ? 'outline outline-[#3b82f6]' : 'outline-none'} ${
+            isSelected 
+              ? 'border-transparent shadow-[0_20px_40px_-8px_rgba(0,0,0,0.2),0_12px_24px_-6px_rgba(0,0,0,0.12)] dark:shadow-[0_24px_48px_-8px_rgba(0,0,0,0.6)] -translate-y-1' 
+              : 'border border-gray-200/90 dark:border-[#404040]/90 shadow-[0_1px_2px_rgba(0,0,0,0.06),0_0_1px_rgba(0,0,0,0.08)] dark:shadow-[0_1px_2px_rgba(0,0,0,0.35)] translate-y-0 hover:shadow-[0_3px_8px_rgba(0,0,0,0.08)] hover:border-gray-300 dark:hover:border-neutral-600'
           }`}
           style={{ 
             width: w, 
             height: h,
-            outlineWidth: pickerSelectionIndex && pickerSelectionIndex > 0 
-              ? 'calc(4px / var(--current-scale, 1))' 
-              : isPickerTarget
-                ? 'calc(2px / var(--current-scale, 1))'
-                : isSelected 
-                  ? 'calc(2px / var(--current-scale, 1))' 
-                  : '0px',
-            boxShadow: pickerSelectionIndex && pickerSelectionIndex > 0
-              ? '0 12px 30px rgba(37, 99, 235, 0.45)'
-              : isSelected 
-                ? '0 20px 40px -8px rgba(0, 0, 0, 0.22)' 
-                : undefined,
-            transitionProperty: 'box-shadow, border-color, width, height, outline-color, outline-width',
+            outlineWidth: isSelected ? 'calc(2px / var(--current-scale, 1))' : '0px',
+            boxShadow: isSelected ? '0 20px 40px -8px rgba(0, 0, 0, 0.22)' : undefined,
+            transitionProperty: 'box-shadow, transform, border-color, width, height',
             transitionDuration: '180ms',
             transitionTimingFunction: 'ease-out'
           }}
@@ -665,43 +437,6 @@ export const GenerationCard = React.memo(function GenerationCard({
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerUp}
         >
-        {/* File Name Tag */}
-        {data.fileName && (
-          <div 
-            className="absolute z-[60] pointer-events-none group-data-[scale-micro=true]/canvas:opacity-0 transition-opacity duration-300"
-            style={{
-              top: 'calc(12px / var(--current-scale, 1))',
-              left: 'calc(12px / var(--current-scale, 1))',
-              transform: 'scale(calc(1 / var(--current-scale, 1)))',
-              transformOrigin: 'top left',
-              maxWidth: 'calc(var(--current-scale, 1) * 100% - 24px)'
-            }}
-          >
-            <div className="bg-black/60 px-2.5 py-1.5 rounded-lg border border-white/10 shadow-sm flex items-center">
-              <span className="text-white/95 text-[13px] font-medium truncate leading-none tracking-wide">
-                {data.fileName.replace(/\.[^/.]+$/, "")}
-              </span>
-            </div>
-          </div>
-        )}
-
-        {/* Resolution Tag */}
-        {resolutionTag && (
-          <div 
-            className="absolute z-[60] pointer-events-none group-data-[scale-micro=true]/canvas:opacity-0 transition-opacity duration-300"
-            style={{
-              top: 'calc(12px / var(--current-scale, 1))',
-              right: 'calc(12px / var(--current-scale, 1))',
-              transform: 'scale(calc(1 / var(--current-scale, 1)))',
-              transformOrigin: 'top right',
-            }}
-          >
-            <div className="bg-black/60 px-2 py-1 rounded-md border border-white/10 shadow-sm flex items-center">
-              <span className="text-white/90 text-[10px] font-bold tracking-wider">{resolutionTag}</span>
-            </div>
-          </div>
-        )}
-
         {/* Empty State Placeholder (SVG matching user request) */}
         <div className={`absolute inset-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-800 transition-opacity duration-500 ${!imageUrl ? 'opacity-100' : 'opacity-0'} group-data-[scale-micro=true]/canvas:!opacity-0`}>
           <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-gray-300 dark:text-neutral-600">
@@ -732,8 +467,7 @@ export const GenerationCard = React.memo(function GenerationCard({
               }}
             >
               <div className="absolute inset-0 w-full h-full overflow-hidden squircle group/video pointer-events-auto">
-                {(isHovered || isPlaying) && (
-                  <motion.video 
+                {(isHovered || isPlaying) && <motion.video 
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
                   ref={videoRef}
@@ -775,8 +509,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                     if (thumbUrl) updates.thumbnailUrl = thumbUrl;
                     onUpdate(id, updates, false);
                   }}
-                />
-                )}
+                />}
                 {!isPlaying ? (() => {
                   const narrowerSide = Math.min(w, h);
                   const playButtonDiameter = narrowerSide / 2;
@@ -799,9 +532,9 @@ export const GenerationCard = React.memo(function GenerationCard({
                         }}
                         onClick={(e) => {
                           e.stopPropagation();
-                          setIsPlaying(true);
                           if (videoRef.current) {
-                            videoRef.current.play().catch(console.error);
+                            videoRef.current.play();
+                            setIsPlaying(true);
                           }
                         }}
                       >
@@ -871,8 +604,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                   })()
                 )}
 
-                {/* Progress Bar Controller Overlay */}
-                {(isHovered || isPlaying) && (
+                {(isHovered || isPlaying) && ({/* Progress Bar Controller Overlay */}
                 <div 
                   className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent p-4 pt-12 flex flex-col gap-2 transition-opacity duration-200 opacity-0 group-hover/video:opacity-100 group-data-[scale-micro=true]/canvas:hidden"
                   onPointerDown={(e) => {
@@ -940,7 +672,6 @@ export const GenerationCard = React.memo(function GenerationCard({
                     </span>
                   </div>
                 </div>
-                )}
               </div>
             </div>
           ) : (
@@ -988,164 +719,24 @@ export const GenerationCard = React.memo(function GenerationCard({
         state === 'completed' && !isSelected ? 'opacity-0 pointer-events-none' : 'opacity-100'
       } ${
         isSelected 
-          ? 'shadow-[0_16px_36px_-6px_rgba(0,0,0,0.12),0_8px_16px_-4px_rgba(0,0,0,0.06)] dark:shadow-[0_20px_40px_-6px_rgba(0,0,0,0.45)] translate-y-0' 
+          ? 'shadow-[0_16px_36px_-6px_rgba(0,0,0,0.12),0_8px_16px_-4px_rgba(0,0,0,0.06)] dark:shadow-[0_20px_40px_-6px_rgba(0,0,0,0.45)] -translate-y-0.5' 
           : 'shadow-[0_1px_3px_rgba(0,0,0,0.05),0_1px_2px_rgba(0,0,0,0.03)] dark:shadow-none translate-y-0'
       }`}
         style={{
           marginLeft: (w - 480) / 2,
-          transitionProperty: 'box-shadow, opacity',
+          transitionProperty: 'box-shadow, transform, opacity',
           transitionDuration: '180ms'
         }}
       >
         
         {/* Top: Reference & Actions */}
-        <div className="flex items-start justify-between relative" ref={refMenuContainerRef}>
-          <div className="relative flex items-center gap-1.5 flex-wrap max-w-[280px]">
-            {refList.length > 0 ? (
-              <div className="flex items-center gap-1.5 bg-gray-200/70 dark:bg-neutral-700/70 border border-gray-300/80 dark:border-neutral-600 pl-1.5 pr-1.5 py-1 rounded-xl corner-squircle text-[12px] font-medium text-gray-800 dark:text-neutral-200 shadow-sm transition-all">
-                {/* Stacked thumbnails */}
-                <div className="flex items-center -space-x-2">
-                  {refList.slice(0, 3).map((item, idx) => (
-                    <img 
-                      key={idx}
-                      src={item.url} 
-                      alt={item.name || `参考图 ${idx + 1}`} 
-                      className="w-5 h-5 rounded-md object-cover border border-white dark:border-neutral-800 shadow-xs" 
-                    />
-                  ))}
-                </div>
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    const isAgent = !e.nativeEvent.isTrusted;
-                    setOpenMenu(prev => prev?.type === 'ref' ? null : { type: 'ref', ownerId: isAgent ? 'agent' : 'user' });
-                  }}
-                  className="hover:underline flex items-center gap-1 max-w-[110px] truncate text-left pl-0.5"
-                  title="点击添加或更换参考图"
-                >
-                  <span className="truncate">
-                    {refList.length === 1 ? (refList[0].name || '参考图') : `参考图 (${refList.length})`}
-                  </span>
-                  <ChevronDown className="w-3 h-3 opacity-60 flex-shrink-0" />
-                </button>
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (refList.length > 1) {
-                      onUpdate(id, { referenceImages: [], referenceImageUrl: null, referenceImageFileData: undefined, referenceImageName: undefined }, true);
-                    } else {
-                      removeReferenceImage(0);
-                    }
-                  }}
-                  className="ml-0.5 p-0.5 rounded-md hover:bg-gray-300 dark:hover:bg-neutral-600 text-gray-400 hover:text-red-500 transition-colors"
-                  title="移除参考图"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            ) : (
-              <button 
-                type="button"
-                data-agent-target={`ref-btn-${id}`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  const isAgent = !e.nativeEvent.isTrusted;
-                  setOpenMenu(prev => prev?.type === 'ref' ? null : { type: 'ref', ownerId: isAgent ? 'agent' : 'user' });
-                }}
-                className={`flex items-center gap-1.5 bg-gray-100 dark:bg-neutral-800 hover:bg-gray-200 dark:hover:bg-neutral-700 border border-gray-200 dark:border-[#404040] text-gray-700 dark:text-neutral-300 px-3 py-1.5 rounded-xl corner-squircle text-[12px] font-medium transition-colors shadow-sm group-data-[zooming=true]/canvas:!shadow-none ${openMenu?.type === 'ref' ? 'ring-2 ring-blue-500/50 dark:ring-blue-400/50' : ''}`}
-              >
-                <Plus className="w-3.5 h-3.5" /> 参考图
-              </button>
-            )}
-
-            {/* Dropdown with 3 options: 本地上传, 资产列表, 画布导入 */}
-            <AnimatePresence>
-              {openMenu?.type === 'ref' && (
-                <motion.div
-                  initial={{ opacity: 0, y: 4, scale: 0.96 }}
-                  animate={{ opacity: 1, y: 0, scale: 1 }}
-                  exit={{ opacity: 0, y: 4, scale: 0.96 }}
-                  transition={{ duration: 0.15 }}
-                  className="absolute top-[calc(100%+6px)] left-0 w-36 bg-white dark:bg-neutral-800 border border-gray-200 dark:border-[#404040] rounded-xl corner-squircle shadow-[0_12px_32px_rgba(0,0,0,0.18)] p-1.5 z-50 flex flex-col gap-0.5"
-                >
-                  <button
-                    type="button"
-                    data-agent-target={`ref-option-local-${id}`}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      fileInputRef.current?.click();
-                      setOpenMenu(null);
-                    }}
-                    className="flex items-center gap-2 px-2.5 py-2 rounded-lg text-left text-[13px] font-medium text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700 transition-colors"
-                  >
-                    <Upload className="w-3.5 h-3.5 text-blue-500 dark:text-blue-400" />
-                    <span>本地上传</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    data-agent-target={`ref-option-asset-${id}`}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setOpenMenu(null);
-                      setShowAssetPicker(true);
-                    }}
-                    className="flex items-center gap-2 px-2.5 py-2 rounded-lg text-left text-[13px] font-medium text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700 transition-colors"
-                  >
-                    <Sparkles className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400" />
-                    <span>资产列表</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    data-agent-target={`ref-option-canvas-${id}`}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setOpenMenu(null);
-                      onStartCanvasPicker?.(id);
-                    }}
-                    className="flex items-center gap-2 px-2.5 py-2 rounded-lg text-left text-[13px] font-medium text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700 transition-colors"
-                  >
-                    <LayoutGrid className="w-3.5 h-3.5 text-emerald-500 dark:text-emerald-400" />
-                    <span>画布导入</span>
-                  </button>
-                </motion.div>
-              )}
-            </AnimatePresence>
-
-            {/* Hidden native file input for 本地上传 */}
-            <input 
-              ref={fileInputRef}
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={handleLocalUpload}
-            />
-          </div>
+        <div className="flex items-start justify-between">
+          <button className={`flex items-center gap-1.5 bg-gray-100 dark:bg-neutral-800 hover:bg-gray-200 dark:hover:bg-neutral-700 border border-gray-200 dark:border-[#404040] text-gray-700 dark:text-neutral-300 px-3 py-1.5 rounded-xl corner-squircle text-[12px] font-medium transition-colors shadow-sm group-data-[zooming=true]/canvas:!shadow-none`}>
+            <Plus className="w-3.5 h-3.5" /> 参考图
+          </button>
           
-          {/* Picker Mode Indicator Badge on top of card */}
-          {isPickerSelectable && (
-            <div className={`absolute -top-3 -right-3 z-30 flex items-center justify-center w-7 h-7 rounded-full text-xs font-bold transition-all transform shadow-md ${
-              pickerSelectionIndex && pickerSelectionIndex > 0
-                ? 'bg-blue-600 text-white scale-110 ring-4 ring-blue-500/30'
-                : 'bg-neutral-800/85 hover:bg-blue-500 text-white hover:scale-105 border border-white/40'
-            }`}>
-              {pickerSelectionIndex && pickerSelectionIndex > 0 ? pickerSelectionIndex : '+'}
-            </div>
-          )}
-
-          {isPickerTarget && (
-            <div className="absolute -top-3 -left-3 z-30 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-500 text-white shadow-md uppercase tracking-wider">
-              当前目标
-            </div>
-          )}
-
-          {/* Default selection delete button */}
-          {isSelected && !isPickerSelectable && (
+          {isSelected && (
             <button 
-              type="button"
               onClick={() => onDelete?.(id)}
               className="text-gray-400 dark:text-neutral-500 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950 p-1.5 rounded-lg corner-squircle transition-colors"
               title="删除 (Backspace/Delete)"
@@ -1272,128 +863,6 @@ export const GenerationCard = React.memo(function GenerationCard({
       </div>
       )}
       </motion.div>
-
-      {/* Portal: Asset List Modal */}
-      {showAssetPicker && typeof document !== 'undefined' && createPortal(
-        <div 
-          className="fixed inset-0 z-[1000] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm pointer-events-auto"
-          onPointerDown={(e) => e.stopPropagation()}
-          onClick={() => setShowAssetPicker(false)}
-        >
-          <div 
-            className="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden text-neutral-900 dark:text-neutral-100"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {/* Modal Header */}
-            <div className="flex items-center justify-between px-6 py-4 border-b border-neutral-200 dark:border-neutral-800">
-              <div className="flex items-center gap-2.5">
-                <div className="p-2 rounded-xl bg-amber-500/10 text-amber-500 dark:text-amber-400">
-                  <Sparkles className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3 className="text-base font-semibold">选择资产列表参考图</h3>
-                  <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-0.5">从当前剧本中选择角色、场景或道具作为生图参考图</p>
-                </div>
-              </div>
-              <button 
-                type="button"
-                onClick={() => setShowAssetPicker(false)}
-                className="p-1.5 rounded-lg text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            {/* Filter and Search Bar */}
-            <div className="px-6 py-3 border-b border-neutral-200 dark:border-neutral-800 flex items-center gap-3 bg-neutral-50/50 dark:bg-neutral-900/50">
-              {/* Category tabs */}
-              <div className="flex items-center gap-1 bg-neutral-200/60 dark:bg-neutral-800 p-1 rounded-xl text-xs font-medium">
-                <button
-                  type="button"
-                  onClick={() => setAssetFilter('all')}
-                  className={`px-3 py-1.5 rounded-lg transition-colors ${assetFilter === 'all' ? 'bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-sm' : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white'}`}
-                >
-                  全部 ({allAssetItems.length})
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setAssetFilter('characters')}
-                  className={`px-3 py-1.5 rounded-lg transition-colors ${assetFilter === 'characters' ? 'bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-sm' : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white'}`}
-                >
-                  角色 ({characterItems.length})
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setAssetFilter('locations')}
-                  className={`px-3 py-1.5 rounded-lg transition-colors ${assetFilter === 'locations' ? 'bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-sm' : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white'}`}
-                >
-                  场景 ({locationItems.length})
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setAssetFilter('props')}
-                  className={`px-3 py-1.5 rounded-lg transition-colors ${assetFilter === 'props' ? 'bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-sm' : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white'}`}
-                >
-                  道具 ({propItems.length})
-                </button>
-              </div>
-
-              {/* Search input */}
-              <div className="relative flex-1">
-                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
-                <input 
-                  type="text"
-                  value={assetSearch}
-                  onChange={(e) => setAssetSearch(e.target.value)}
-                  placeholder="搜索资产关键词..."
-                  className="w-full pl-9 pr-3 py-1.5 text-xs rounded-xl bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 focus:outline-none focus:ring-2 focus:ring-amber-500/50 text-neutral-900 dark:text-neutral-100"
-                />
-              </div>
-            </div>
-
-            {/* Asset Items Grid */}
-            <div className="flex-1 overflow-y-auto p-6 grid grid-cols-1 sm:grid-cols-2 gap-3">
-              {filteredAssets.length > 0 ? (
-                filteredAssets.map(item => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => handleSelectAsset({ name: item.name, referenceImage: item.referenceImage, description: item.description })}
-                    className="flex items-start gap-3 p-3 rounded-xl border border-neutral-200/80 dark:border-neutral-800 hover:border-amber-500/60 dark:hover:border-amber-500/60 hover:bg-amber-50/30 dark:hover:bg-amber-950/20 text-left transition-all group cursor-pointer"
-                  >
-                    <div className="w-14 h-14 rounded-lg overflow-hidden bg-neutral-100 dark:bg-neutral-800 flex-shrink-0 flex items-center justify-center border border-neutral-200 dark:border-neutral-700">
-                      {item.referenceImage ? (
-                        <img src={item.referenceImage} alt={item.name} className="w-full h-full object-cover group-hover:scale-105 transition-transform" />
-                      ) : item.category === 'characters' ? (
-                        <User className="w-6 h-6 text-neutral-400 group-hover:text-amber-500 transition-colors" />
-                      ) : item.category === 'locations' ? (
-                        <MapPin className="w-6 h-6 text-neutral-400 group-hover:text-amber-500 transition-colors" />
-                      ) : (
-                        <Box className="w-6 h-6 text-neutral-400 group-hover:text-amber-500 transition-colors" />
-                      )}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-semibold truncate group-hover:text-amber-600 dark:group-hover:text-amber-400 transition-colors">{item.name}</span>
-                        <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-neutral-100 dark:bg-neutral-800 text-neutral-500 dark:text-neutral-400 font-medium">{item.categoryLabel}</span>
-                      </div>
-                      <p className="text-xs text-neutral-500 dark:text-neutral-400 truncate mt-0.5">{item.tag}</p>
-                      {item.description && (
-                        <p className="text-[11px] text-neutral-400 dark:text-neutral-500 line-clamp-2 mt-1 leading-snug">{item.description}</p>
-                      )}
-                    </div>
-                  </button>
-                ))
-              ) : (
-                <div className="col-span-full py-12 text-center text-neutral-400 dark:text-neutral-500 text-xs">
-                  暂无匹配的资产条目
-                </div>
-              )}
-            </div>
-          </div>
-        </div>,
-        document.body
-      )}
     </motion.div>
   );
 });

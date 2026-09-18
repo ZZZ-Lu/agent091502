@@ -1,0 +1,211 @@
+                width: w * dpr,
+                height: h * dpr,
+                transform: dpr > 1 ? `scale(${1 / dpr})` : undefined,
+                transformOrigin: 'top left',
+                backgroundImage: data.thumbnailUrl ? `url(${data.thumbnailUrl})` : undefined,
+                backgroundSize: 'cover',
+                backgroundPosition: 'center',
+              }}
+            >
+              <div className="absolute inset-0 w-full h-full overflow-hidden squircle group/video pointer-events-auto">
+                <motion.video 
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  ref={videoRef}
+                  src={imageUrl} 
+                  loop 
+                  playsInline
+                  className="absolute inset-0 w-full h-full object-cover pointer-events-none transition-opacity duration-700 group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform group-data-[zooming=true]/canvas:!opacity-0"
+                  onLoadedMetadata={(e) => {
+                    const video = e.currentTarget;
+                    setDuration(video.duration || 0);
+                    if (currentTime !== undefined) {
+                      video.currentTime = currentTime;
+                      setProgress((currentTime / (video.duration || 1)) * 100);
+                    } else if (video.duration && video.duration > 0.05) {
+                      // Match NanoLOD's default 0.05s frame capture to prevent frame shifting
+                      video.currentTime = 0.05;
+                    }
+                  }}
+                  onTimeUpdate={(e) => {
+                    const video = e.currentTarget;
+                    const currTime = video.currentTime;
+                    if (video.duration) {
+                      setProgress((currTime / video.duration) * 100);
+                    }
+                    if (Math.abs(currTime - lastSavedTimeRef.current) >= 1.5) {
+                      lastSavedTimeRef.current = currTime;
+                      const updates: Partial<CardData> = { currentTime: currTime };
+                      const thumbUrl = generateThumbnail(video);
+                      if (thumbUrl) updates.thumbnailUrl = thumbUrl;
+                      onUpdate(id, updates, false);
+                    }
+                  }}
+                  onPause={(e) => {
+                    const video = e.currentTarget;
+                    const currTime = video.currentTime;
+                    lastSavedTimeRef.current = currTime;
+                    const updates: Partial<CardData> = { currentTime: currTime };
+                    const thumbUrl = generateThumbnail(video);
+                    if (thumbUrl) updates.thumbnailUrl = thumbUrl;
+                    onUpdate(id, updates, false);
+                  }}
+                />
+                {!isPlaying ? (() => {
+                  const narrowerSide = Math.min(w, h);
+                  const playButtonDiameter = narrowerSide / 2;
+                  const playButtonIconSize = playButtonDiameter * 0.76;
+                  return (
+                    <div 
+                      className="absolute inset-0 flex items-center justify-center bg-black/25 hover:bg-black/35 transition-colors pointer-events-none"
+                    >
+                      <div 
+                        className="rounded-full bg-white/40 dark:bg-black/50 border border-white/30 dark:border-white/10 shadow-xl flex items-center justify-center transform hover:scale-105 transition-transform cursor-pointer pointer-events-auto group-data-[scale-micro=true]/canvas:!scale-100"
+                        style={{
+                          width: playButtonDiameter,
+                          height: playButtonDiameter,
+                        }}
+                        onPointerDown={(e) => {
+                          // Prevent card drag only on left-click of play button, allow middle click to pan
+                          if (e.button === 0) {
+                            e.stopPropagation();
+                          }
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (videoRef.current) {
+                            videoRef.current.play();
+                            setIsPlaying(true);
+                          }
+                        }}
+                      >
+                        <svg 
+                          viewBox="0 0 24 24" 
+                          fill="currentColor" 
+                          xmlns="http://www.w3.org/2000/svg" 
+                          className="text-white/85"
+                          style={{
+                            width: playButtonIconSize,
+                            height: playButtonIconSize,
+                          }}
+                        >
+                          <path d="M8 6.5v11c0 .8.9 1.3 1.6.9l8.5-5.5a1 1 0 0 0 0-1.8L9.6 5.6c-.7-.4-1.6.1-1.6.9z"/>
+                        </svg>
+                      </div>
+                    </div>
+                  );
+                })() : (
+                  (() => {
+                    const narrowerSide = Math.min(w, h);
+                    const playButtonDiameter = narrowerSide / 2;
+                    const playButtonIconSize = playButtonDiameter * 0.76;
+                    return (
+                      <div 
+                        className="absolute inset-0 bg-transparent hover:bg-black/5 transition-all duration-200 flex items-center justify-center pointer-events-none"
+                      >
+                        <div 
+                          className="rounded-full bg-white/40 dark:bg-black/50 border border-white/30 dark:border-white/10 shadow-xl flex items-center justify-center transform hover:scale-105 transition-transform duration-200 opacity-0 hover:opacity-100 cursor-pointer pointer-events-auto"
+                          style={{
+                            width: playButtonDiameter,
+                            height: playButtonDiameter,
+                          }}
+                          onPointerDown={(e) => {
+                            // Prevent card drag only on left-click, allow middle click to pan
+                            if (e.button === 0) {
+                              e.stopPropagation();
+                            }
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (videoRef.current) {
+                              videoRef.current.pause();
+                              setIsPlaying(false);
+                              const currTime = videoRef.current.currentTime;
+                              lastSavedTimeRef.current = currTime;
+                              onUpdate(id, { currentTime: currTime }, false);
+                            }
+                          }}
+                        >
+                          <svg 
+                            viewBox="0 0 24 24" 
+                            fill="currentColor" 
+                            xmlns="http://www.w3.org/2000/svg" 
+                            className="text-white/85"
+                            style={{
+                              width: playButtonIconSize,
+                              height: playButtonIconSize,
+                            }}
+                          >
+                            <rect x="6" y="4.5" width="4" height="15" rx="1.5" />
+                            <rect x="14" y="4.5" width="4" height="15" rx="1.5" />
+                          </svg>
+                        </div>
+                      </div>
+                    );
+                  })()
+                )}
+
+                {/* Progress Bar Controller Overlay */}
+                <div 
+                  className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent p-4 pt-12 flex flex-col gap-2 transition-opacity duration-200 opacity-0 group-hover/video:opacity-100 group-data-[scale-micro=true]/canvas:hidden"
+                  onPointerDown={(e) => {
+                    // Prevent card dragging when interacting with controls
+                    if (e.button === 0) {
+                      e.stopPropagation();
+                    }
+                  }}
+                >
+                  <div className="flex items-center gap-3">
+                    {/* Miniature Play/Pause Button */}
+                    <button
+                      type="button"
+                      className="text-white hover:text-blue-400 transition-colors cursor-pointer focus:outline-none flex-shrink-0"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (videoRef.current) {
+                          if (isPlaying) {
+                            videoRef.current.pause();
+                            setIsPlaying(false);
+                            const currTime = videoRef.current.currentTime;
+                            lastSavedTimeRef.current = currTime;
+                            onUpdate(id, { currentTime: currTime }, false);
+                          } else {
+                            videoRef.current.play();
+                            setIsPlaying(true);
+                          }
+                        }
+                      }}
+                    >
+                      {isPlaying ? (
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <path d="M6 19H10V5H6V19ZM14 5V19H18V5H14Z" fill="currentColor"/>
+                        </svg>
+                      ) : (
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <path d="M8 5V19L19 12L8 5Z" fill="currentColor"/>
+                        </svg>
+                      )}
+                    </button>
+
+                    {/* Range Slider */}
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      step="0.1"
+                      value={progress}
+                      onChange={(e) => {
+                        const pct = parseFloat(e.target.value);
+                        setProgress(pct);
+                        if (videoRef.current && duration) {
+                          const targetTime = (pct / 100) * duration;
+                          videoRef.current.currentTime = targetTime;
+                          lastSavedTimeRef.current = targetTime;
+                          onUpdate(id, { currentTime: targetTime }, false);
+                        }
+                      }}
+                      className="w-full h-1 bg-transparent rounded-lg appearance-none cursor-pointer accent-blue-500 focus:outline-none [&::-webkit-slider-runnable-track]:bg-white/20 [&::-webkit-slider-runnable-track]:h-1 [&::-webkit-slider-runnable-track]:rounded-lg [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-500 hover:[&::-webkit-slider-thumb]:scale-125 [&::-webkit-slider-thumb]:-translate-y-[4px]"
+                    />
+
+                    {/* Time Stamps */}
+                    <span className="text-[10px] font-mono text-white/90 select-none flex-shrink-0">

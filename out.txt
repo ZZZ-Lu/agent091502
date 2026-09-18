@@ -1,0 +1,12 @@
+          title="重做 (Ctrl+Y / Ctrl+Shift+Z)"
+        >
+          <Redo2 className="w-4 h-4 text-gray-700 dark:text-neutral-300" />
+        </button>
+      </div>
+
+      {/* Real-time FPS Counter */}
+      <FpsCounter hasActiveTask={!!agentTask} />
+
+    </div>
+  );
+}

@@ -1,0 +1,141 @@
+    if (files.length === 0) return;
+
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    // Calculate canvas drop coordinates
+    const dropClientX = e.clientX;
+    const dropClientY = e.clientY;
+    const dropCanvasX = (dropClientX - tx.get()) / tScale.get();
+    const dropCanvasY = (dropClientY - ty.get()) / tScale.get();
+    // Step 1: Fast initialization for immediate visual feedback
+    const initialCards: CardData[] = [];
+    const validFiles: { 
+      file: File, isImage: boolean, isVideo: boolean, id: string, 
+      width: number, height: number, customWidth?: number, customHeight?: number, 
+      ratio: '1:1' | '3:4' | '9:16' | '16:9' 
+    }[] = [];
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const isImage = file.type.startsWith('image/');
+      const isVideo = file.type.startsWith('video/');
+      if (!isImage && !isVideo) continue;
+
+      const fileUrl = URL.createObjectURL(file);
+      let width = 0;
+      let height = 0;
+      
+      try {
+        if (isImage) {
+          const dims = await getImageDimensions(fileUrl);
+          width = dims.width;
+          height = dims.height;
+        } else if (isVideo) {
+          const dims = await getVideoDimensions(fileUrl);
+          width = dims.width;
+          height = dims.height;
+        }
+      } catch (e) {
+        console.error("Failed to read dimensions quickly", e);
+      }
+
+      const ratio = getClosestAspectRatio(width, height);
+      let customWidth: number | undefined;
+      let customHeight: number | undefined;
+      if (width > 0 && height > 0) {
+        const TARGET_AREA = 230400; // 480x480 standard equivalent
+        const scaleFactor = Math.sqrt(TARGET_AREA / (width * height));
+        customWidth = Math.round(width * scaleFactor);
+        customHeight = Math.round(height * scaleFactor);
+      }
+
+      const newId = Math.random().toString(36).substring(2, 11);
+      const offset = i * 40;
+      const dim = customWidth && customHeight ? { width: customWidth, height: customHeight } : CARD_DIMENSIONS[ratio];
+
+      initialCards.push({
+        id: newId,
+        x: dropCanvasX - dim.width / 2 + offset,
+        y: dropCanvasY - dim.height / 2 + offset,
+        state: 'generating',
+        ratio: ratio,
+        res: '2K',
+        prompt: `Dropped local ${isVideo ? 'video' : 'image'}: ${file.name}`,
+        imageUrl: null, // Don't show original uncompressed image immediately to avoid UI lag. Generating spinner will show.
+        isVideo: isVideo,
+        customWidth: customWidth,
+        customHeight: customHeight,
+      });
+
+      validFiles.push({ file, isImage, isVideo, id: newId, width, height, customWidth, customHeight, ratio });
+    }
+
+    if (initialCards.length === 0) return;
+
+    // Step 2: Show placeholders on canvas immediately
+    setCards(prev => [...prev, ...initialCards]);
+    setSelectedCardIds(initialCards.map(c => c.id));
+
+    // Step 3: Start heavy background processing
+    validFiles.forEach(async (item) => {
+      let processedFile: Blob = item.file;
+      let originalFileData: Blob | undefined = undefined;
+      let trueOriginalFileData: Blob | undefined = undefined;
+      let originalImageUrl: string | undefined = undefined;
+      let trueOriginalImageUrl: string | undefined = undefined;
+
+      if (item.isImage) {
+        try {
+          // Generate 1200px preview
+          processedFile = await compressAndResizeImage(item.file, 1200);
+          
+          // Check if original is > 10000px (GPU texture limit safety)
+          const MAX_TEXTURE_DIM = 10000;
+          if (item.width > MAX_TEXTURE_DIM || item.height > MAX_TEXTURE_DIM) {
+            trueOriginalFileData = item.file;
+            trueOriginalImageUrl = URL.createObjectURL(item.file);
+            
+            // Create a safe proxy for the "original" view in the UI to prevent GPU crashes
+            originalFileData = await compressAndResizeImage(item.file, MAX_TEXTURE_DIM, 0.9);
+            originalImageUrl = URL.createObjectURL(originalFileData);
+          } else {
+            // It's under 10000px, so the original file is the proxy itself
+            originalFileData = item.file;
+            originalImageUrl = URL.createObjectURL(item.file);
+          }
+        } catch (err) {
+          console.error("Failed to process image", err);
+          processedFile = await compressAndResizeImage(item.file, 1200);
+          originalFileData = item.file;
+          originalImageUrl = URL.createObjectURL(item.file);
+        }
+      }
+
+      const processedFileUrl = URL.createObjectURL(processedFile);
+
+      let thumbnailUrl: string | undefined;
+      try {
+        if (item.isVideo) {
+          thumbnailUrl = await generateVideoThumbnail(processedFile, MAX_THUMBNAIL_EDGE);
+        } else {
+          thumbnailUrl = await generateImageThumbnail(processedFile, MAX_THUMBNAIL_EDGE);
+        }
+      } catch (thumbErr) {
+        console.warn('Could not pre-generate thumbnail on drop:', thumbErr);
+      }
+
+      // Step 4: Update the specific card with completed data
+      setCards(prev => prev.map(c => c.id === item.id ? {
+        ...c,
+        state: 'completed',
+        imageUrl: processedFileUrl,
+        fileData: processedFile,
+        originalFileData: originalFileData,
+        trueOriginalFileData: trueOriginalFileData,
+        originalImageUrl: originalImageUrl,
+        trueOriginalImageUrl: trueOriginalImageUrl,
+        thumbnailUrl: thumbnailUrl,
+      } : c));
+    });
+

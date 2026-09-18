@@ -1,10 +1,12 @@
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { AgentCursor } from './components/AgentCursor';
 import { AgentContextMenu } from './components/AgentContextMenu';
-import { GenerationCard, CardData, CARD_DIMENSIONS } from './components/GenerationCard';
+import { GenerationCard, CardData, CARD_DIMENSIONS, getCardSize } from './components/GenerationCard';
 import { NanoLodCanvas } from './components/NanoLodCanvas';
+import { FpsCounter } from './components/FpsCounter';
 import { generateImageThumbnail, generateVideoThumbnail, getOrCreateMediaThumbnail, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
-import { isCardIntersectingCircle } from './utils/viewportCulling';
+import { fastGetImageDimensions } from './utils/imageHeader';
+import { isCardIntersectingRectangle, getLodMountQuota } from './utils/viewportCulling';
 import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X } from 'lucide-react';
 import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
 import { SettingsPage } from './components/SettingsPage';
@@ -199,6 +201,92 @@ const getClosestAspectRatio = (width: number, height: number): '1:1' | '3:4' | '
   return closestRatio;
 };
 
+// Isolated Zoom Indicator HUD: Subscribes to tScale without triggering App root re-renders
+const ZoomControlGroup: React.FC<{
+  tScale: any;
+  isOverviewMode: boolean;
+  onZoomIn: () => void;
+  onZoomOut: () => void;
+  onZoomReset: () => void;
+}> = React.memo(({ tScale, isOverviewMode, onZoomIn, onZoomOut, onZoomReset }) => {
+  const [scaleVal, setScaleVal] = useState(() => tScale.get());
+
+  useEffect(() => {
+    let rafId: number | null = null;
+    const unsub = tScale.on('change', (s: number) => {
+      if (rafId === null) {
+        rafId = requestAnimationFrame(() => {
+          rafId = null;
+          setScaleVal(s);
+        });
+      }
+    });
+    return () => {
+      unsub();
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
+  }, [tScale]);
+
+  const pct = Math.round(scaleVal * 100);
+  let text = "";
+  let colorClass = "";
+  if (pct < 60) {
+    text = "远景";
+    colorClass = "text-blue-500 dark:text-blue-400";
+  } else if (pct < 100) {
+    text = "中景";
+    colorClass = "text-emerald-500 dark:text-emerald-400";
+  } else if (pct < 200) {
+    text = "近景";
+    colorClass = "text-amber-500 dark:text-amber-400";
+  } else {
+    text = "特写";
+    colorClass = "text-rose-500 dark:text-rose-400";
+  }
+
+  return (
+    <div 
+      className="fixed bottom-6 left-6 z-50 flex items-center bg-gray-100/90 dark:bg-neutral-800/90 backdrop-blur-md border border-gray-200/80 dark:border-[#404040]/80 shadow-md rounded-[20px] corner-squircle p-1.5 gap-1 select-none"
+      onPointerDown={e => e.stopPropagation()}
+    >
+      <button
+        onClick={onZoomOut}
+        disabled={isOverviewMode}
+        className="p-1.5 rounded-xl corner-squircle hover:bg-gray-200 dark:hover:bg-neutral-700 disabled:opacity-40 transition-colors"
+        title="缩小"
+      >
+        <Minus className="w-3.5 h-3.5 text-gray-700 dark:text-neutral-300" />
+      </button>
+      
+      <button
+        onClick={onZoomReset}
+        className="px-2 py-1 rounded-xl corner-squircle hover:bg-gray-200 dark:hover:bg-neutral-700 transition-colors text-[11px] font-bold font-mono text-gray-800 dark:text-neutral-200 min-w-[54px] flex items-center justify-center gap-1.5"
+        title="重置到 100%"
+      >
+        {isOverviewMode ? (
+          <span className="text-blue-500 dark:text-blue-400 font-semibold tracking-wide">
+            全景
+          </span>
+        ) : (
+          <>
+            <span className={colorClass}>{text}</span>
+            <span>{pct}%</span>
+          </>
+        )}
+      </button>
+
+      <button
+        onClick={onZoomIn}
+        disabled={scaleVal >= 4.99}
+        className="p-1.5 rounded-xl corner-squircle hover:bg-gray-200 dark:hover:bg-neutral-700 disabled:opacity-40 transition-colors"
+        title="放大"
+      >
+        <Plus className="w-3.5 h-3.5 text-gray-700 dark:text-neutral-300" />
+      </button>
+    </div>
+  );
+});
+
 export default function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   
@@ -222,12 +310,19 @@ export default function App() {
   const gridBackgroundSize = useTransform(tScale, (s: any) => `${s * 48}px ${s * 48}px`);
 
   // Inject real-time scale as CSS variable for GPU-accelerated constant-width borders
-  useMotionValueEvent(tScale, "change", (latestScale) => {
+  const updateCurrentScale = (latestScale: number) => {
     const workspace = document.getElementById('canvas-workspace');
     if (workspace) {
       workspace.style.setProperty('--current-scale', latestScale.toString());
     }
-  });
+  };
+  
+  useMotionValueEvent(tScale, "change", updateCurrentScale);
+  
+  // Set initial scale on mount
+  useEffect(() => {
+    updateCurrentScale(tScale.get());
+  }, []);
 
   const transformValues = useMemo(() => ({ tx, ty, tScale }), [tx, ty, tScale]);
   const targetTransform = useRef({ x: initialTransform.x, y: initialTransform.y, scale: initialTransform.scale });
@@ -270,14 +365,17 @@ export default function App() {
     showSettingsRef.current = showSettings;
   }, [showSettings]);
 
-  const [zoomScale, setZoomScale] = useState(() => tScale.get());
-
-  useEffect(() => {
-    const unsub = tScale.on('change', (s) => {
-      setZoomScale(s);
-    });
-    return () => unsub();
-  }, [tScale]);
+  const [isOverviewMode, setIsOverviewMode] = useState(false);
+  const isOverviewModeRef = useRef(false);
+  const preOverviewTransform = useRef<{ x: number, y: number, scale: number } | null>(null);
+  const isSpacePressedRef = useRef(false);
+  const wheelZoomOutAccumulatorRef = useRef(0);
+  const [showOverviewPromptToast, setShowOverviewPromptToast] = useState(false);
+  const [overviewPromptProgress, setOverviewPromptProgress] = useState(0);
+  const overviewToastTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const resetOverviewPromptRef = useRef<() => void>(() => {});
+  const enterOverviewModeRef = useRef<() => void>(() => {});
+  const exitOverviewToOriginalRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', isDarkMode);
@@ -451,6 +549,7 @@ export default function App() {
   const [isZooming, setIsZooming] = useState(false);
   const isZoomingRef = useRef(false);
   const zoomTimeoutRef = useRef<NodeJS.Timeout>();
+  const doubleClickTimeoutRef = useRef<NodeJS.Timeout>();
   const lastPointer = useRef({ x: 0, y: 0 });
   const [selectedCardIds, setSelectedCardIds] = useState<string[]>([]);
   const [selectionBox, setSelectionBox] = useState<{
@@ -524,6 +623,16 @@ export default function App() {
   const cardsRef = useRef<CardData[]>(cards);
   cardsRef.current = cards;
   const clipboardRef = useRef<CardData[]>([]);
+
+  // Canvas Reference Picker Session State
+  const [pickerSession, setPickerSession] = useState<{
+    targetCardId: string;
+    selectedCardIds: string[];
+    initialCamera: { x: number; y: number; scale: number };
+  } | null>(null);
+  const pickerSessionRef = useRef(pickerSession);
+  pickerSessionRef.current = pickerSession;
+
   const nanoDragRef = useRef<{
     cardId: string;
     startX: number;
@@ -585,7 +694,6 @@ export default function App() {
     setIsDragOver(false);
 
     if (!e.dataTransfer || !e.dataTransfer.files) return;
-
     const files = Array.from(e.dataTransfer.files) as File[];
     if (files.length === 0) return;
 
@@ -598,12 +706,86 @@ export default function App() {
     const dropCanvasX = (dropClientX - tx.get()) / tScale.get();
     const dropCanvasY = (dropClientY - ty.get()) / tScale.get();
 
-    // Process files in parallel to read natural dimensions
-    const cardPromises = files.map(async (file, index) => {
+    // Step 1: Ultra-fast header parsing (<1ms per image) to get true aspect ratio immediately
+    const cardInitPromises = files.map(async (file, index) => {
       const isImage = file.type.startsWith('image/');
       const isVideo = file.type.startsWith('video/');
-
       if (!isImage && !isVideo) return null;
+
+      const fileUrl = URL.createObjectURL(file);
+      let width = 0;
+      let height = 0;
+
+      try {
+        if (isImage) {
+          const dims = await fastGetImageDimensions(file);
+          width = dims.width;
+          height = dims.height;
+        } else if (isVideo) {
+          const dims = await getVideoDimensions(fileUrl);
+          width = dims.width;
+          height = dims.height;
+        }
+      } catch (err) {
+        console.warn('Fast dimensions parsing failed, fallback:', err);
+      }
+
+      // Preserve natural aspect ratio and scale to standard visual area
+      const ratio = getClosestAspectRatio(width, height);
+      let customWidth: number | undefined;
+      let customHeight: number | undefined;
+      if (width > 0 && height > 0) {
+        const TARGET_AREA = 230400; // 480x480 standard equivalent
+        const scaleFactor = Math.sqrt(TARGET_AREA / (width * height));
+        customWidth = Math.round(width * scaleFactor);
+        customHeight = Math.round(height * scaleFactor);
+      }
+
+      const dim = customWidth && customHeight ? { width: customWidth, height: customHeight } : CARD_DIMENSIONS[ratio];
+      const newId = Math.random().toString(36).substring(2, 11);
+      const offset = index * 40;
+
+      // Card is created immediately at the exact aspect ratio with the image visible!
+      const initialCard: CardData = {
+        id: newId,
+        x: dropCanvasX - dim.width / 2 + offset,
+        y: dropCanvasY - dim.height / 2 + offset,
+        state: 'generating', // shows the sleek loading spinner overlay on top of the image
+        ratio: ratio,
+        res: '2K',
+        prompt: `Dropped local ${isVideo ? 'video' : 'image'}: ${file.name}`,
+        imageUrl: fileUrl, // Visible on the canvas instantly!
+        isVideo: isVideo,
+        customWidth: customWidth,
+        customHeight: customHeight,
+        fileName: file.name,
+        nativeWidth: width,
+        nativeHeight: height,
+      };
+
+      return {
+        card: initialCard,
+        file,
+        fileUrl,
+        isImage,
+        isVideo,
+        width,
+        height,
+      };
+    });
+
+    const parsedItems = (await Promise.all(cardInitPromises)).filter(Boolean);
+    if (parsedItems.length === 0) return;
+
+    // Immediately place all cards on canvas with their true aspect ratio and visible image!
+    const initialCards = parsedItems.map(item => item!.card);
+    setCards(prev => [...prev, ...initialCards]);
+    setSelectedCardIds(initialCards.map(c => c.id));
+
+    // Step 2: Background processing (non-blocking) - compress preview, check texture limits, generate thumbnails
+    parsedItems.forEach(async (item) => {
+      if (!item) return;
+      const { file, fileUrl, isImage, isVideo, width, height, card } = item;
 
       let processedFile: Blob = file;
       let originalFileData: Blob | undefined = undefined;
@@ -611,55 +793,34 @@ export default function App() {
       let originalImageUrl: string | undefined = undefined;
       let trueOriginalImageUrl: string | undefined = undefined;
 
-      let width = 0;
-      let height = 0;
-
       if (isImage) {
         try {
-          const originalDims = await getImageDimensions(URL.createObjectURL(file));
-          width = originalDims.width;
-          height = originalDims.height;
-          
-          // Generate 1200px preview
+          // Generate 1200px preview for optimal performance when zoomed
           processedFile = await compressAndResizeImage(file, 1200);
-          
-          // Check if original is > 4K (using 3840 as 4K edge)
-          const MAX_4K_DIM = 3840;
-          if (width > MAX_4K_DIM || height > MAX_4K_DIM) {
+
+          // Check if original is > 4K (4096px) (GPU texture limit safety & LOD optimization)
+          const MAX_TEXTURE_DIM = 4096;
+          if (width > MAX_TEXTURE_DIM || height > MAX_TEXTURE_DIM) {
             trueOriginalFileData = file;
-            trueOriginalImageUrl = URL.createObjectURL(file);
-            
-            // Create a 4K proxy for the "original" view in the UI
-            originalFileData = await compressAndResizeImage(file, MAX_4K_DIM, 0.9);
+            trueOriginalImageUrl = fileUrl;
+
+            // Create a safe 4K proxy for the "original" view in the UI to prevent GPU crashes and optimize VRAM
+            originalFileData = await compressAndResizeImage(file, MAX_TEXTURE_DIM, 0.9);
             originalImageUrl = URL.createObjectURL(originalFileData);
           } else {
-            // It's under 4K, so the original file is the 4K proxy itself
+            // Under 4K, original file is proxy itself
             originalFileData = file;
-            originalImageUrl = URL.createObjectURL(file);
+            originalImageUrl = fileUrl;
           }
         } catch (err) {
-          console.error("Failed to read image dimensions", err);
+          console.error("Failed to process image in background", err);
           processedFile = await compressAndResizeImage(file, 1200);
           originalFileData = file;
-          originalImageUrl = URL.createObjectURL(file);
-        }
-      } else if (isVideo) {
-        try {
-          const dims = await getVideoDimensions(URL.createObjectURL(file));
-          width = dims.width;
-          height = dims.height;
-        } catch (err) {
-          console.error("Failed to read video dimensions", err);
+          originalImageUrl = fileUrl;
         }
       }
 
-      const fileUrl = URL.createObjectURL(processedFile);
-      const newId = Math.random().toString(36).substring(2, 11);
-      const offset = index * 40;
-
-      // Default aspect ratio if mapping fails
-      const ratio = getClosestAspectRatio(width, height);
-      const dim = CARD_DIMENSIONS[ratio];
+      const processedFileUrl = URL.createObjectURL(processedFile);
 
       let thumbnailUrl: string | undefined;
       try {
@@ -672,35 +833,21 @@ export default function App() {
         console.warn('Could not pre-generate thumbnail on drop:', thumbErr);
       }
 
-      const card: CardData = {
-        id: newId,
-        x: dropCanvasX - dim.width / 2 + offset,
-        y: dropCanvasY - dim.height / 2 + offset,
+      // Step 3: Seamlessly complete import - spinner fades away, optimized preview & thumbnail saved
+      setCards(prev => prev.map(c => c.id === card.id ? {
+        ...c,
         state: 'completed',
-        ratio: ratio,
-        res: '2K',
-        prompt: `Dropped local ${isVideo ? 'video' : 'image'}: ${file.name}`,
-        imageUrl: fileUrl,
-        isVideo: isVideo,
+        imageUrl: processedFileUrl,
         fileData: processedFile,
         originalFileData: originalFileData,
         trueOriginalFileData: trueOriginalFileData,
         originalImageUrl: originalImageUrl,
         trueOriginalImageUrl: trueOriginalImageUrl,
         thumbnailUrl: thumbnailUrl,
-      };
-
-      return card;
+      } : c));
     });
-
-    const results = await Promise.all(cardPromises);
-    const validCards = results.filter((c): c is CardData => c !== null);
-
-    if (validCards.length > 0) {
-      setCards(prev => [...prev, ...validCards]);
-      setSelectedCardIds(validCards.map(c => c.id));
-    }
   }, [tx, ty, tScale]);
+
 
   // --- Canvas Transform Project Sync ---
   // Load canvas transform per project
@@ -851,6 +998,23 @@ export default function App() {
             if (card.trueOriginalFileData) {
               updates.trueOriginalImageUrl = URL.createObjectURL(card.trueOriginalFileData);
             }
+            // Restore local reference image Blob URLs to prevent broken image references on reload
+            if (card.referenceImages && card.referenceImages.length > 0) {
+              updates.referenceImages = card.referenceImages.map(ref => {
+                if (ref.fileData) {
+                  return {
+                    ...ref,
+                    url: URL.createObjectURL(ref.fileData)
+                  };
+                }
+                return ref;
+              });
+              if (updates.referenceImages[0]?.url) {
+                updates.referenceImageUrl = updates.referenceImages[0].url;
+              }
+            } else if (card.referenceImageFileData) {
+              updates.referenceImageUrl = URL.createObjectURL(card.referenceImageFileData);
+            }
             return {
               ...card,
               ...updates
@@ -888,6 +1052,23 @@ export default function App() {
               }
               if (card.trueOriginalFileData) {
                 updates.trueOriginalImageUrl = URL.createObjectURL(card.trueOriginalFileData);
+              }
+              // Restore local reference image Blob URLs to prevent broken image references on reload for legacy scoped cards
+              if (card.referenceImages && card.referenceImages.length > 0) {
+                updates.referenceImages = card.referenceImages.map(ref => {
+                  if (ref.fileData) {
+                    return {
+                      ...ref,
+                      url: URL.createObjectURL(ref.fileData)
+                    };
+                  }
+                  return ref;
+                });
+                if (updates.referenceImages[0]?.url) {
+                  updates.referenceImageUrl = updates.referenceImages[0].url;
+                }
+              } else if (card.referenceImageFileData) {
+                updates.referenceImageUrl = URL.createObjectURL(card.referenceImageFileData);
               }
               return {
                 ...card,
@@ -938,6 +1119,140 @@ export default function App() {
     setCards(prev => prev.map(c => c.id === id ? { ...c, ...updates } : c), shouldPush);
   }, []);
 
+  // Start Canvas Reference Picker Session
+  const handleStartCanvasPicker = useCallback((targetCardId: string) => {
+    const currentCamera = {
+      x: tx.get(),
+      y: ty.get(),
+      scale: tScale.get()
+    };
+    
+    // Find already existing references on the target card to pre-populate the picker
+    const targetCard = cards.find(c => c.id === targetCardId);
+    const existingRefs = targetCard?.referenceImages && targetCard.referenceImages.length > 0
+      ? targetCard.referenceImages
+      : targetCard?.referenceImageUrl
+        ? [{ url: targetCard.referenceImageUrl, name: targetCard.referenceImageName, fileData: targetCard.referenceImageFileData }]
+        : [];
+    const existingUrls = new Set(existingRefs.map(r => r.url).filter(Boolean));
+    
+    const initialSelectedCardIds = cards
+      .filter(c => {
+        const img = c.imageUrl || c.originalImageUrl || c.thumbnailUrl;
+        return img && existingUrls.has(img);
+      })
+      .map(c => c.id);
+
+    setPickerSession({
+      targetCardId,
+      selectedCardIds: initialSelectedCardIds,
+      initialCamera: currentCamera
+    });
+  }, [tx, ty, tScale, cards]);
+
+  // Toggle a card selection in picker session
+  const handleTogglePickerCard = useCallback((cardId: string) => {
+    setPickerSession(prev => {
+      if (!prev) return null;
+      if (prev.targetCardId === cardId) return prev; // Cannot pick target itself
+      const isSelected = prev.selectedCardIds.includes(cardId);
+      const nextSelected = isSelected
+        ? prev.selectedCardIds.filter(id => id !== cardId)
+        : [...prev.selectedCardIds, cardId];
+      return { ...prev, selectedCardIds: nextSelected };
+    });
+  }, []);
+
+  // Cancel picker session and fly back
+  const handleCancelPickerSession = useCallback(() => {
+    if (!pickerSession) return;
+    const { initialCamera } = pickerSession;
+    
+    // Sync the virtual camera target position to prevent wheel jump
+    targetTransform.current = {
+      x: initialCamera.x,
+      y: initialCamera.y,
+      scale: initialCamera.scale
+    };
+
+    // Animate smoothly back to initial camera
+    animate(tx, initialCamera.x, { duration: 0.4, ease: [0.16, 1, 0.3, 1] });
+    animate(ty, initialCamera.y, { duration: 0.4, ease: [0.16, 1, 0.3, 1] });
+    animate(tScale, initialCamera.scale, { duration: 0.4, ease: [0.16, 1, 0.3, 1] });
+    setPickerSession(null);
+  }, [pickerSession, tx, ty, tScale]);
+
+  // Confirm picker session and apply reference images
+  const handleConfirmPickerSession = useCallback(() => {
+    if (!pickerSession) return;
+    const { targetCardId, selectedCardIds, initialCamera } = pickerSession;
+    
+    if (selectedCardIds.length > 0) {
+      const targetCard = cardsRef.current.find(c => c.id === targetCardId);
+      const pickedCards = cardsRef.current.filter(c => selectedCardIds.includes(c.id));
+      
+      const newReferences = pickedCards.map(c => ({
+        url: c.imageUrl || c.originalImageUrl || c.thumbnailUrl || '',
+        name: c.fileName ? c.fileName.replace(/\.[^/.]+$/, "") : (c.prompt ? (c.prompt.length > 14 ? c.prompt.slice(0, 14) + '...' : c.prompt) : '画布卡片'),
+        fileData: c.trueOriginalFileData || c.originalFileData || c.fileData
+      })).filter(r => Boolean(r.url));
+
+      const existingRefs = targetCard?.referenceImages && targetCard.referenceImages.length > 0
+        ? targetCard.referenceImages
+        : targetCard?.referenceImageUrl
+          ? [{ url: targetCard.referenceImageUrl, name: targetCard.referenceImageName, fileData: targetCard.referenceImageFileData }]
+          : [];
+
+      // Preserve existing non-canvas references (e.g., raw local uploads directly to card)
+      const canvasCardUrls = new Set(cardsRef.current.map(c => c.imageUrl || c.originalImageUrl || c.thumbnailUrl).filter(Boolean));
+      const nonCanvasRefs = existingRefs.filter(ref => !canvasCardUrls.has(ref.url));
+
+      const mergedRefs = [...nonCanvasRefs, ...newReferences];
+      
+      if (mergedRefs.length > 0) {
+        handleUpdateCard(targetCardId, {
+          referenceImages: mergedRefs,
+          referenceImageUrl: mergedRefs[0].url,
+          referenceImageName: mergedRefs.length > 1 ? `参考图 (${mergedRefs.length})` : mergedRefs[0].name,
+          referenceImageFileData: mergedRefs[0].fileData
+        }, true);
+      } else {
+        handleUpdateCard(targetCardId, {
+          referenceImages: [],
+          referenceImageUrl: null,
+          referenceImageName: undefined,
+          referenceImageFileData: undefined
+        }, true);
+      }
+    } else {
+      // If all selections are removed, clear reference images on the card
+      handleUpdateCard(targetCardId, {
+        referenceImages: [],
+        referenceImageUrl: null,
+        referenceImageName: undefined,
+        referenceImageFileData: undefined
+      }, true);
+    }
+
+    // Cinematic fly back to target card position
+    const targetCard = cardsRef.current.find(c => c.id === targetCardId);
+    const finalX = targetCard ? -targetCard.x * initialCamera.scale + window.innerWidth / 2 - (CARD_DIMENSIONS[targetCard.ratio]?.width || 320) * initialCamera.scale / 2 : initialCamera.x;
+    const finalY = targetCard ? -targetCard.y * initialCamera.scale + window.innerHeight / 2 - (CARD_DIMENSIONS[targetCard.ratio]?.height || 320) * initialCamera.scale / 2 : initialCamera.y;
+
+    // Sync the virtual camera target position to prevent wheel jump
+    targetTransform.current = {
+      x: finalX,
+      y: finalY,
+      scale: initialCamera.scale
+    };
+
+    animate(tx, finalX, { duration: 0.45, ease: [0.16, 1, 0.3, 1] });
+    animate(ty, finalY, { duration: 0.45, ease: [0.16, 1, 0.3, 1] });
+    animate(tScale, initialCamera.scale, { duration: 0.45, ease: [0.16, 1, 0.3, 1] });
+
+    setPickerSession(null);
+  }, [pickerSession, handleUpdateCard, tx, ty, tScale]);
+
   const selectedCardIdsRef = useRef(selectedCardIds);
   useEffect(() => {
     selectedCardIdsRef.current = selectedCardIds;
@@ -963,7 +1278,7 @@ export default function App() {
     const nextSet = new Set<string>();
 
     for (const card of currentCards) {
-      if (selectedIds.includes(card.id) || isCardIntersectingCircle(card, vp)) {
+      if (selectedIds.includes(card.id) || isCardIntersectingRectangle(card, vp)) {
         nextSet.add(card.id);
       }
     }
@@ -999,6 +1314,10 @@ export default function App() {
   useEffect(() => {
     let rafId: number | null = null;
     const scheduleCheck = () => {
+      // Intent-driven lazy restoration: pause culling queries while actively zooming/dragging to maintain 60fps
+      if (isZoomingRef.current || isDraggingCanvasRef.current || (window as any).isDraggingCard) {
+        return;
+      }
       if (rafId === null) {
         rafId = requestAnimationFrame(() => {
           rafId = null;
@@ -1057,7 +1376,9 @@ export default function App() {
     return unsub;
   }, [tScale]);
 
-  const [maxDOMCardsAllowed, setMaxDOMCardsAllowed] = useState(Infinity);
+  // Set of DOM-mounted card IDs (asynchronous frame-budgeted progressive mounting)
+  const [renderedCardIds, setRenderedCardIds] = useState<Set<string>>(() => new Set());
+  const [mountEpoch, setMountEpoch] = useState(0);
 
   const handleCardDrag = useCallback((id: string, dx: number, dy: number) => {
     // No-op. Real-time dragging is now fully handled in DOM by GenerationCard.tsx (Master-Slave architecture).
@@ -1065,6 +1386,7 @@ export default function App() {
   }, []);
 
   const handleCardDragEnd = useCallback((id: string, totalDx: number, totalDy: number) => {
+    if (Math.abs(totalDx) < 0.5 && Math.abs(totalDy) < 0.5) return;
     setCards(prev => {
       const selectedIds = selectedCardIdsRef.current;
       const isDraggingSelected = selectedIds.includes(id);
@@ -1087,9 +1409,21 @@ export default function App() {
     if (e.shiftKey || e.ctrlKey || e.metaKey) {
       setSelectedCardIds(prev => prev.includes(id) ? prev.filter(cid => cid !== id) : [...prev, id]);
     } else {
-      setSelectedCardIds(prev => prev.includes(id) ? prev : [id]);
+      setSelectedCardIds(prev => (prev.length === 1 && prev[0] === id) ? prev : [id]);
     }
   }, []);
+
+  const handleCardSelectWrapped = useCallback((e: React.PointerEvent, id: string) => {
+    const session = pickerSessionRef.current;
+    if (session) {
+      if (id !== session.targetCardId) {
+        e.stopPropagation();
+        handleTogglePickerCard(id);
+      }
+    } else {
+      handleCardSelect(e, id);
+    }
+  }, [handleCardSelect, handleTogglePickerCard]);
 
   const handleCardDelete = useCallback((id: string) => {
     setCards(prev => prev.filter(c => c.id !== id));
@@ -1128,7 +1462,18 @@ export default function App() {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const activeTag = document.activeElement?.tagName;
-      const isInputActive = activeTag === 'TEXTAREA' || activeTag === 'INPUT';
+      const isInputActive = activeTag === 'TEXTAREA' || activeTag === 'INPUT' || document.activeElement?.hasAttribute('contenteditable');
+      const isSpaceKey = e.code === 'Space' || e.key === ' ' || e.keyCode === 32;
+
+      if (isSpaceKey && !isInputActive) {
+        if (isSpacePressedRef.current || isOverviewModeRef.current) {
+          e.preventDefault();
+          return;
+        }
+        e.preventDefault();
+        isSpacePressedRef.current = true;
+        enterOverviewModeRef.current();
+      }
 
       if ((e.ctrlKey || e.metaKey) && !isInputActive) {
         if (e.code === 'KeyZ' || e.key.toLowerCase() === 'z') {
@@ -1188,8 +1533,34 @@ export default function App() {
       }
     };
     
+    const handleKeyUp = (e: KeyboardEvent) => {
+      const activeTag = document.activeElement?.tagName;
+      const isInputActive = activeTag === 'TEXTAREA' || activeTag === 'INPUT' || document.activeElement?.hasAttribute('contenteditable');
+      const isSpaceKey = e.code === 'Space' || e.key === ' ' || e.keyCode === 32;
+
+      if (isSpaceKey) {
+        isSpacePressedRef.current = false;
+        if (!isInputActive && (preOverviewTransform.current || isOverviewModeRef.current)) {
+          exitOverviewToOriginalRef.current();
+        }
+      }
+    };
+
+    const handleBlur = () => {
+      isSpacePressedRef.current = false;
+      if (preOverviewTransform.current || isOverviewModeRef.current) {
+        exitOverviewToOriginalRef.current();
+      }
+    };
+
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleBlur);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleBlur);
+    };
   }, []); // We use refs for state to avoid re-binding on every selection change
 
   const handleContextMenu = (e: React.MouseEvent) => {
@@ -1211,7 +1582,7 @@ export default function App() {
     if (!targetId && isNanoLod) {
       for (let i = cards.length - 1; i >= 0; i--) {
         const c = cards[i];
-        const dim = CARD_DIMENSIONS[c.ratio] || { width: 480, height: 480 };
+        const dim = getCardSize(c);
         if (canvasX >= c.x && canvasX <= c.x + dim.width && canvasY >= c.y && canvasY <= c.y + dim.height) {
           targetId = c.id;
           break;
@@ -2014,6 +2385,7 @@ export default function App() {
     const currentScale = tScale.get();
     setIsMicroLod(currentScale < 0.60);
     setIsNanoLod(currentScale < 0.60);
+    setMountEpoch(n => (n + 1) % 1000000);
     
     const workspace = document.getElementById('canvas-workspace');
     if (workspace) {
@@ -2040,7 +2412,115 @@ export default function App() {
     return () => { delete (window as any).resetGlobalZoomTimer; };
   }, [restoreCanvasStyles, tScale]);
 
+  const resetOverviewPrompt = useCallback(() => {
+    wheelZoomOutAccumulatorRef.current = 0;
+    if (overviewToastTimerRef.current) {
+      clearTimeout(overviewToastTimerRef.current);
+      overviewToastTimerRef.current = null;
+    }
+    setShowOverviewPromptToast(false);
+    setOverviewPromptProgress(0);
+  }, []);
+  resetOverviewPromptRef.current = resetOverviewPrompt;
+
+  const enterOverviewMode = useCallback(() => {
+    resetOverviewPrompt();
+    if (isOverviewModeRef.current) return;
+
+    // Save current transform state to revert if needed
+    if (!preOverviewTransform.current) {
+      preOverviewTransform.current = {
+        x: targetTransform.current.x,
+        y: targetTransform.current.y,
+        scale: targetTransform.current.scale
+      };
+    }
+
+    const container = containerRef.current;
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    
+    // Calculate world bounding box
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    if (cardsRef.current.length === 0) {
+       minX = -1000; minY = -1000; maxX = 1000; maxY = 1000;
+    } else {
+       cardsRef.current.forEach(c => {
+         const dim = getCardSize(c);
+         if (c.x < minX) minX = c.x;
+         if (c.y < minY) minY = c.y;
+         if (c.x + dim.width > maxX) maxX = c.x + dim.width;
+         if (c.y + dim.height > maxY) maxY = c.y + dim.height;
+       });
+    }
+    
+    // Add padding
+    const padding = 1500;
+    minX -= padding;
+    minY -= padding;
+    maxX += padding;
+    maxY += padding;
+    
+    const worldW = maxX - minX;
+    const worldH = maxY - minY;
+    
+    // Calculate scale to fit screen
+    const targetScale = Math.min(rect.width / worldW, rect.height / worldH);
+    
+    // Calculate tx and ty to center the bounding box
+    const targetTx = (rect.width / 2) - ((minX + maxX) / 2) * targetScale;
+    const targetTy = (rect.height / 2) - ((minY + maxY) / 2) * targetScale;
+    
+    targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
+    
+    // Prepare LOD transition
+    const workspace = document.getElementById('canvas-workspace');
+    if (workspace && workspace.getAttribute('data-zooming') !== 'true') {
+      workspace.setAttribute('data-zooming', 'true');
+      isZoomingRef.current = true;
+      setIsZooming(true);
+    }
+    clearTimeout(zoomTimeoutRef.current);
+    zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 2000);
+    
+    const animConfig: any = { type: 'tween', duration: 0.4, ease: [0.16, 1, 0.3, 1] };
+    animate(tScale, targetScale, animConfig);
+    animate(tx, targetTx, animConfig);
+    animate(ty, targetTy, animConfig);
+
+    setIsOverviewMode(true);
+    isOverviewModeRef.current = true;
+  }, [tScale, tx, ty, restoreCanvasStyles, resetOverviewPrompt]);
+
+  const exitOverviewToOriginal = useCallback(() => {
+    resetOverviewPrompt();
+    if (preOverviewTransform.current) {
+      const { x, y, scale } = preOverviewTransform.current;
+      targetTransform.current = { x, y, scale };
+      
+      const animConfig: any = { type: 'tween', duration: 0.4, ease: [0.16, 1, 0.3, 1] };
+      animate(tScale, scale, animConfig);
+      animate(tx, x, animConfig);
+      animate(ty, y, animConfig);
+      
+      clearTimeout(zoomTimeoutRef.current);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 400);
+      
+      preOverviewTransform.current = null;
+    }
+    setIsOverviewMode(false);
+    isOverviewModeRef.current = false;
+  }, [tScale, tx, ty, restoreCanvasStyles, resetOverviewPrompt]);
+
+  enterOverviewModeRef.current = enterOverviewMode;
+  exitOverviewToOriginalRef.current = exitOverviewToOriginal;
+
   const animateZoomTo = useCallback((newScale: number) => {
+    resetOverviewPrompt();
+    preOverviewTransform.current = null;
+    setIsOverviewMode(false);
+    isOverviewModeRef.current = false;
+
     const prevScale = tScale.get();
     if (Math.abs(prevScale - newScale) < 0.001) return;
     
@@ -2072,25 +2552,120 @@ export default function App() {
     animate(tScale, newScale, { type: 'tween', duration: 0.22, ease: 'easeOut' });
     animate(tx, newX, { type: 'tween', duration: 0.22, ease: 'easeOut' });
     animate(ty, newY, { type: 'tween', duration: 0.22, ease: 'easeOut' });
-  }, [tScale, tx, ty, restoreCanvasStyles]);
+  }, [tScale, tx, ty, restoreCanvasStyles, resetOverviewPrompt]);
 
   const handleZoomIn = useCallback(() => {
+    resetOverviewPrompt();
+    preOverviewTransform.current = null;
+    setIsOverviewMode(false);
+    isOverviewModeRef.current = false;
     const prevScale = tScale.get();
     const newScale = Math.min(prevScale * 1.2, 5);
     animateZoomTo(newScale);
-  }, [tScale, animateZoomTo]);
+  }, [tScale, animateZoomTo, resetOverviewPrompt]);
 
   const handleZoomOut = useCallback(() => {
     const prevScale = tScale.get();
+    if (prevScale <= 0.105) {
+      wheelZoomOutAccumulatorRef.current += 1;
+      const progress = Math.min(1, wheelZoomOutAccumulatorRef.current / 8);
+      setOverviewPromptProgress(progress);
+      setShowOverviewPromptToast(true);
+
+      if (overviewToastTimerRef.current) {
+        clearTimeout(overviewToastTimerRef.current);
+      }
+      overviewToastTimerRef.current = setTimeout(() => {
+        resetOverviewPrompt();
+      }, 1800);
+
+      if (wheelZoomOutAccumulatorRef.current >= 8) {
+        resetOverviewPrompt();
+        enterOverviewMode();
+      }
+      return;
+    }
     const newScale = Math.max(prevScale / 1.2, 0.1);
     animateZoomTo(newScale);
-  }, [tScale, animateZoomTo]);
+  }, [tScale, animateZoomTo, enterOverviewMode, resetOverviewPrompt]);
 
   const handleZoomReset = useCallback(() => {
+    preOverviewTransform.current = null;
+    setIsOverviewMode(false);
+    isOverviewModeRef.current = false;
     animateZoomTo(1);
   }, [animateZoomTo]);
 
-  useEffect(() => {
+  const handleDoubleClick = useCallback((e: React.MouseEvent) => {
+    // 1. Ignore double-clicks on interactive elements (inputs, textareas, buttons, modal dialogs, etc.)
+    const target = e.target as HTMLElement | null;
+    if (!target) return;
+    if (target.closest('input, textarea, select, button, [contenteditable="true"], [role="button"], [role="dialog"], aside, [data-prevent-canvas-wheel]')) {
+      return;
+    }
+
+    const container = containerRef.current;
+    if (!container) return;
+
+    // Prevent default selection side-effects
+    e.preventDefault();
+    window.getSelection()?.removeAllRanges();
+
+    clearTimeout(doubleClickTimeoutRef.current);
+
+    const rect = container.getBoundingClientRect();
+    const cursorX = e.clientX - rect.left;
+    const cursorY = e.clientY - rect.top;
+
+    // Calculate clicked world position
+    const currentScale = tScale.get();
+    const currentTx = tx.get();
+    const currentTy = ty.get();
+    const worldX = (cursorX - currentTx) / currentScale;
+    const worldY = (cursorY - currentTy) / currentScale;
+
+    // Intent-Driven Lazy Restoration: degrade heavy effects during rapid tween
+    const workspace = document.getElementById('canvas-workspace');
+    if (workspace && workspace.getAttribute('data-zooming') !== 'true') {
+      workspace.setAttribute('data-zooming', 'true');
+      isZoomingRef.current = true;
+      setIsZooming(true);
+    }
+
+    // Direct Double Click Zoom Toggle:
+    // If zoomed in (scale >= 0.20), zoom directly out to 10% (0.1) anchored at the exact mouse cursor position
+    // If zoomed out (scale < 0.20), zoom directly into 100% (1.0) anchored at the exact mouse cursor position
+    if (currentScale >= 0.20) {
+      const targetScale = 0.1;
+      const targetTx = cursorX - worldX * targetScale;
+      const targetTy = cursorY - worldY * targetScale;
+
+      targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
+
+      clearTimeout(zoomTimeoutRef.current);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 2000);
+
+      animate(tScale, targetScale, { type: 'tween', duration: 0.40, ease: [0.16, 1, 0.3, 1] });
+      animate(tx, targetTx, { type: 'tween', duration: 0.40, ease: [0.16, 1, 0.3, 1] });
+      animate(ty, targetTy, { type: 'tween', duration: 0.40, ease: [0.16, 1, 0.3, 1] });
+    } else {
+      // Zoom directly into 100% anchored at the exact mouse cursor position
+      const targetScale = 1.0;
+      const targetTx = cursorX - worldX * targetScale;
+      const targetTy = cursorY - worldY * targetScale;
+
+      targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
+
+      clearTimeout(zoomTimeoutRef.current);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 150);
+
+      animate(tScale, targetScale, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
+      animate(tx, targetTx, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
+      animate(ty, targetTy, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
+    }
+  }, [tScale, tx, ty, restoreCanvasStyles]);
+
+    useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
@@ -2117,14 +2692,82 @@ export default function App() {
       }
 
       e.preventDefault();
+      clearTimeout(doubleClickTimeoutRef.current);
       
+      // Per user request: Mouse wheel directly zooms the canvas (no Ctrl required).
+      // If deltaY is 0 (e.g. pure horizontal trackpad swipe), we ignore it since zoom relies on vertical scroll axis.
+      if (e.deltaY === 0) return;
+
+      // If currently in overview mode:
+      if (isOverviewModeRef.current) {
+        // Scrolling up (zooming in) breaks out of overview focused on mouse cursor position
+        if (e.deltaY < -15) {
+          const rect = container.getBoundingClientRect();
+          const cursorX = e.clientX - rect.left;
+          const cursorY = e.clientY - rect.top;
+          const currentScale = tScale.get();
+          const worldX = (cursorX - tx.get()) / currentScale;
+          const worldY = (cursorY - ty.get()) / currentScale;
+
+          const targetScale = preOverviewTransform.current ? preOverviewTransform.current.scale : 1.0;
+          const targetTx = cursorX - worldX * targetScale;
+          const targetTy = cursorY - worldY * targetScale;
+
+          targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
+
+          const animConfig: any = { type: 'tween', duration: 0.4, ease: [0.16, 1, 0.3, 1] };
+          animate(tScale, targetScale, animConfig);
+          animate(tx, targetTx, animConfig);
+          animate(ty, targetTy, animConfig);
+
+          clearTimeout(zoomTimeoutRef.current);
+          zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 400);
+
+          preOverviewTransform.current = null;
+          setIsOverviewMode(false);
+          isOverviewModeRef.current = false;
+          return;
+        }
+        // Ignore further wheel zoom out while in overview
+        return;
+      }
+
+      const prevTarget = targetTransform.current;
+
+      // Special breakout to Overview Mode when already at 10% min zoom and continuing to scroll out:
+      if (prevTarget.scale <= 0.105 && e.deltaY > 0) {
+        const isDiscreteWheel = Math.abs(e.deltaY) >= 20;
+        const step = isDiscreteWheel ? 1 : Math.max(e.deltaY / 100, 0.25);
+        wheelZoomOutAccumulatorRef.current += step;
+        const progress = Math.min(1, wheelZoomOutAccumulatorRef.current / 8);
+        setOverviewPromptProgress(progress);
+        setShowOverviewPromptToast(true);
+
+        if (overviewToastTimerRef.current) {
+          clearTimeout(overviewToastTimerRef.current);
+        }
+        overviewToastTimerRef.current = setTimeout(() => {
+          resetOverviewPromptRef.current();
+        }, 1800);
+
+        if (wheelZoomOutAccumulatorRef.current >= 8) {
+          resetOverviewPromptRef.current();
+          enterOverviewModeRef.current();
+          return;
+        }
+        return;
+      } else if (e.deltaY < 0) {
+        if (wheelZoomOutAccumulatorRef.current > 0 || overviewToastTimerRef.current) {
+          resetOverviewPromptRef.current();
+        }
+      }
+
       const isDiscrete = Math.abs(e.deltaY) >= 20;
       
       // 1. Bypass React's 16ms delay: synchronously mutate DOM for immediate style degradation (Fixes start stutter)
       const workspace = document.getElementById('canvas-workspace');
       if (workspace && workspace.getAttribute('data-zooming') !== 'true') {
         workspace.setAttribute('data-zooming', 'true');
-        // We also sync the React state so it doesn't fight us later
         isZoomingRef.current = true;
         setIsZooming(true);
       }
@@ -2132,10 +2775,10 @@ export default function App() {
       // 2. Clear the fallback timeout on every wheel tick
       clearTimeout(zoomTimeoutRef.current);
       
-      const zoomSensitivity = 0.002;
+      // Continuous pinch on touchpad produces smaller deltaY, discrete mouse wheel produces larger deltaY
+      const zoomSensitivity = isDiscrete ? 0.002 : 0.004;
       const delta = -e.deltaY * zoomSensitivity;
       
-      const prevTarget = targetTransform.current;
       const newScale = Math.min(Math.max(0.1, prevTarget.scale * Math.exp(delta)), 5);
       
       // 3. LOD Rasterization Strategy:
@@ -2165,16 +2808,62 @@ export default function App() {
       }
     };
 
+    const preventGesture = (e: Event) => e.preventDefault();
+    container.addEventListener('gesturestart', preventGesture);
+    container.addEventListener('gesturechange', preventGesture);
+    container.addEventListener('gestureend', preventGesture);
     container.addEventListener('wheel', handleWheel, { passive: false });
-    return () => container.removeEventListener('wheel', handleWheel);
+
+    return () => {
+      container.removeEventListener('gesturestart', preventGesture);
+      container.removeEventListener('gesturechange', preventGesture);
+      container.removeEventListener('gestureend', preventGesture);
+      container.removeEventListener('wheel', handleWheel);
+    };
   }, [tx, ty, tScale, restoreCanvasStyles]);
 
   const onPointerDown = (e: React.PointerEvent) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    if (e.button === 0 && (preOverviewTransform.current || isOverviewModeRef.current)) {
+      e.stopPropagation();
+      e.preventDefault();
+      
+      const currentScale = tScale.get();
+      const currentTx = tx.get();
+      const currentTy = ty.get();
+      
+      const clickX = e.clientX - rect.left;
+      const clickY = e.clientY - rect.top;
+      
+      const worldX = (clickX - currentTx) / currentScale;
+      const worldY = (clickY - currentTy) / currentScale;
+      
+      const targetScale = preOverviewTransform.current ? preOverviewTransform.current.scale : 1.0;
+      const targetTx = clickX - worldX * targetScale;
+      const targetTy = clickY - worldY * targetScale;
+      
+      targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
+      
+      const animConfig: any = { type: 'tween', duration: 0.4, ease: [0.16, 1, 0.3, 1] };
+      animate(tScale, targetScale, animConfig);
+      animate(tx, targetTx, animConfig);
+      animate(ty, targetTy, animConfig);
+      
+      clearTimeout(zoomTimeoutRef.current);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 400);
+      
+      // Clear overview state to commit the new position
+      preOverviewTransform.current = null;
+      setIsOverviewMode(false);
+      isOverviewModeRef.current = false;
+      return;
+    }
+
     if (e.button === 0) {
-      const rect = containerRef.current?.getBoundingClientRect();
-      if (rect) {
-        const cursorX = e.clientX - rect.left;
-        const cursorY = e.clientY - rect.top;
+      const cursorX = e.clientX - rect.left;
+      const cursorY = e.clientY - rect.top;
         const canvasX = (cursorX - tx.get()) / tScale.get();
         const canvasY = (cursorY - ty.get()) / tScale.get();
 
@@ -2184,11 +2873,17 @@ export default function App() {
           let clickedCard: CardData | undefined;
           for (let i = cards.length - 1; i >= 0; i--) {
             const c = cards[i];
-            const dim = CARD_DIMENSIONS[c.ratio] || { width: 480, height: 480 };
+            const dim = getCardSize(c);
             if (canvasX >= c.x && canvasX <= c.x + dim.width && canvasY >= c.y && canvasY <= c.y + dim.height) {
               clickedCard = c;
               break;
             }
+          }
+
+          if (clickedCard && pickerSession) {
+            e.stopPropagation();
+            handleTogglePickerCard(clickedCard.id);
+            return;
           }
 
           if (clickedCard) {
@@ -2222,9 +2917,7 @@ export default function App() {
             currentY: canvasY,
             initialSelectedIds: e.shiftKey || e.ctrlKey || e.metaKey ? [...selectedCardIds] : []
           });
-          containerRef.current?.setPointerCapture(e.pointerId);
         }
-      }
     }
     // Only start dragging on middle click
     if (e.button !== 1) return;
@@ -2291,7 +2984,7 @@ export default function App() {
       const maxY = Math.max(selectionBox.startY, canvasY);
       
       const newlySelected = cards.filter(card => {
-        const dim = CARD_DIMENSIONS[card.ratio];
+        const dim = getCardSize(card);
         const cw = dim.width;
         const ch = dim.height;
         return (
@@ -2334,6 +3027,18 @@ export default function App() {
   };
 
   useEffect(() => {
+    // Escape key listener to exit picker session
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && pickerSession) {
+        e.preventDefault();
+        handleCancelPickerSession();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [pickerSession, handleCancelPickerSession]);
+
+  useEffect(() => {
     // INTENT SIGNAL: The user opened a massive overlay. The canvas is now a background.
     if (showSettings || isScriptDrawerOpen) {
       restoreCanvasStyles();
@@ -2342,7 +3047,8 @@ export default function App() {
 
   useEffect(() => {
     // INTENT SIGNAL: Selecting nodes indicates active inspection or editing intent.
-    if (selectedCardIds.length > 0) {
+    // Guard against running during active camera tween/zoom to avoid frame jitter or premature restoration
+    if (selectedCardIds.length > 0 && !isZoomingRef.current) {
       restoreCanvasStyles();
     }
   }, [selectedCardIds, restoreCanvasStyles]);
@@ -2359,78 +3065,152 @@ export default function App() {
         scale: tScale.get()
       };
       return cards.filter(card => 
-        selectedCardIds.includes(card.id) || isCardIntersectingCircle(card, vp)
+        selectedCardIds.includes(card.id) || isCardIntersectingRectangle(card, vp)
       );
     }
     return cards.filter(card => visibleCardIdSet.has(card.id));
   }, [cards, visibleCardIdSet, selectedCardIds, tx, ty, tScale]);
 
-  // Effect: Increase maxDOMCardsAllowed frame-by-frame when transitioning from Nano-LOD to Micro-LOD
+  // --- Asynchronous Progressive LOD Mounting Engine ---
+  // Guarantees 60fps zooming and panning fluid motion by deferring DOM node mounting.
+  // 1. When actively zooming or dragging: Quota = 0, zero new DOM mounts (pure GPU transform-first).
+  // 2. NanoLodCanvas renders all cards as hardware-accelerated 2D canvas thumbnails underneath.
+  // 3. When motion stops / camera idles: Stagger-mounts cards frame-by-frame starting from center out.
+  // 4. Different LOD levels have adaptive quotas (Macro: 1/f, Standard: 3/f, Micro: 8/f, Nano: 0).
+  // 5. If the user touches the wheel or drags midway, mounting pauses immediately without stutter.
   useEffect(() => {
     if (!isDomCardsActive) {
-      setMaxDOMCardsAllowed(0);
+      setRenderedCardIds(prev => prev.size === 0 ? prev : new Set());
       return;
     }
 
-    // Reset and step load starting at 3 cards
-    let currentLimit = 3;
-    setMaxDOMCardsAllowed(currentLimit);
+    // While user is actively zooming or dragging, strictly freeze DOM mounts for 60fps GPU smoothness
+    if (isZooming || isDraggingCanvasRef.current) {
+      return;
+    }
+
+    const visibleIds = new Set(visibleCards.map(c => c.id));
+    const pendingCards = visibleCards.filter(c => !renderedCardIds.has(c.id));
+    const hasCulled = Array.from(renderedCardIds).some(id => !visibleIds.has(id));
+
+    // If no new cards need mounting and no culled cards need unmounting, we are fully settled!
+    if (pendingCards.length === 0 && !hasCulled) {
+      return;
+    }
+
+    // If only culled cards need unmounting, clean them up immediately
+    if (pendingCards.length === 0 && hasCulled) {
+      setRenderedCardIds(prev => {
+        const next = new Set<string>();
+        for (const id of prev) {
+          if (visibleIds.has(id)) next.add(id);
+        }
+        return next;
+      });
+      return;
+    }
 
     let rafId: number;
-    const step = () => {
-      currentLimit += 3;
-      if (currentLimit >= cards.length + 10) {
-        // Stagger finished, allow unlimited mounting for 100% performance efficiency
-        setMaxDOMCardsAllowed(Infinity);
+
+    const mountStep = () => {
+      // Re-check interaction flag: if user started zooming/dragging during the rAF, abort immediately
+      if (isZoomingRef.current || isDraggingCanvasRef.current || (window as any).isDraggingCard) {
         return;
       }
-      setMaxDOMCardsAllowed(currentLimit);
-      rafId = requestAnimationFrame(step);
+
+      const scaleVal = tScale.get() || 1;
+      const quota = getLodMountQuota(scaleVal, false);
+      if (quota <= 0) return;
+
+      // Calculate distance to viewport center for center-out progressive reveal
+      const centerX = (window.innerWidth / 2 - tx.get()) / scaleVal;
+      const centerY = (window.innerHeight / 2 - ty.get()) / scaleVal;
+
+      const sortedPending = [...pendingCards].sort((a, b) => {
+        const aSel = selectedCardIdsRef.current.includes(a.id);
+        const bSel = selectedCardIdsRef.current.includes(b.id);
+        if (aSel && !bSel) return -1;
+        if (!aSel && bSel) return 1;
+
+        const dimA = getCardSize(a);
+        const dimB = getCardSize(b);
+        const distA = Math.pow((a.x + dimA.width / 2) - centerX, 2) + Math.pow((a.y + dimA.height / 2) - centerY, 2);
+        const distB = Math.pow((b.x + dimB.width / 2) - centerX, 2) + Math.pow((b.y + dimB.height / 2) - centerY, 2);
+        return distA - distB;
+      });
+
+      const batchToMount = sortedPending.slice(0, quota).map(c => c.id);
+
+      setRenderedCardIds(prev => {
+        const next = new Set<string>();
+        // Keep already mounted cards that are still visible
+        for (const id of prev) {
+          if (visibleIds.has(id)) {
+            next.add(id);
+          }
+        }
+        // Add the new quota batch
+        for (const id of batchToMount) {
+          next.add(id);
+        }
+        return next;
+      });
     };
 
-    rafId = requestAnimationFrame(step);
+    rafId = requestAnimationFrame(mountStep);
+
     return () => {
       cancelAnimationFrame(rafId);
     };
-  }, [isDomCardsActive, cards.length]);
-
-  // Pure computed view representing exact, frame-perfect sorted nodes to mount
-  const renderedCardIds = useMemo(() => {
-    if (!isDomCardsActive) return new Set<string>();
-
-    if (maxDOMCardsAllowed === Infinity) {
-      return new Set(visibleCards.map(c => c.id));
-    }
-
-    // Sort visible cards by exact center distance using precise dynamic card dimensions
-    const scaleVal = tScale.get() || 1;
-    const centerX = (window.innerWidth / 2 - tx.get()) / scaleVal;
-    const centerY = (window.innerHeight / 2 - ty.get()) / scaleVal;
-
-    const sortedCards = [...visibleCards].sort((a, b) => {
-      const aSel = selectedCardIdsRef.current.includes(a.id);
-      const bSel = selectedCardIdsRef.current.includes(b.id);
-      if (aSel && !bSel) return -1;
-      if (!aSel && bSel) return 1;
-
-      // Real dimensions from actual aspect ratios
-      const dimA = CARD_DIMENSIONS[a.ratio] || { width: 480, height: 480 };
-      const dimB = CARD_DIMENSIONS[b.ratio] || { width: 480, height: 480 };
-
-      const distA = Math.pow((a.x + dimA.width / 2) - centerX, 2) + Math.pow((a.y + dimA.height / 2) - centerY, 2);
-      const distB = Math.pow((b.x + dimB.width / 2) - centerX, 2) + Math.pow((b.y + dimB.height / 2) - centerY, 2);
-      return distA - distB;
-    });
-
-    const allowedIds = sortedCards.slice(0, maxDOMCardsAllowed).map(c => c.id);
-    return new Set(allowedIds);
-  }, [isDomCardsActive, maxDOMCardsAllowed, visibleCards, tx, ty, tScale]);
+  }, [isDomCardsActive, isZooming, mountEpoch, visibleCards, renderedCardIds, tx, ty, tScale]);
 
   return (
     <div 
       ref={containerRef}
       className="w-screen h-screen overflow-hidden bg-[#e7e7e7] dark:bg-[#1c1c1e] relative select-none touch-none"
       onPointerDownCapture={(e) => {
+        // If in overview mode and user left-clicks, navigate and dive down into the clicked position!
+        if (e.button === 0 && (preOverviewTransform.current || isOverviewModeRef.current)) {
+          e.stopPropagation();
+          e.preventDefault();
+          
+          const rect = containerRef.current?.getBoundingClientRect();
+          if (!rect) return;
+          
+          const currentScale = tScale.get();
+          const currentTx = tx.get();
+          const currentTy = ty.get();
+          
+          const clickX = e.clientX - rect.left;
+          const clickY = e.clientY - rect.top;
+          
+          const worldX = (clickX - currentTx) / currentScale;
+          const worldY = (clickY - currentTy) / currentScale;
+          
+          const targetScale = preOverviewTransform.current ? preOverviewTransform.current.scale : 1.0;
+          const targetTx = clickX - worldX * targetScale;
+          const targetTy = clickY - worldY * targetScale;
+          
+          targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
+          
+          const animConfig: any = { type: 'tween', duration: 0.4, ease: [0.16, 1, 0.3, 1] };
+          animate(tScale, targetScale, animConfig);
+          animate(tx, targetTx, animConfig);
+          animate(ty, targetTy, animConfig);
+          
+          clearTimeout(zoomTimeoutRef.current);
+          zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 400);
+          
+          // Clear overview state to commit the new position
+          preOverviewTransform.current = null;
+          setIsOverviewMode(false);
+          isOverviewModeRef.current = false;
+          return;
+        }
+
+        // If in overview mode, clicking doesn't restore styles yet (until animation ends or it commits)
+        if (preOverviewTransform.current || isOverviewModeRef.current) return;
+
         // INTENT SIGNAL: Intercept left-clicks in the capture phase.
         // If they click on a card, the card's `isSelected` state will grant it "privilege" 
         // to restore its own shadow instantly via CSS, so we DO NOT restore globally here.
@@ -2446,6 +3226,7 @@ export default function App() {
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
+      onDoubleClick={handleDoubleClick}
       onContextMenu={handleContextMenu}
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
@@ -2547,16 +3328,11 @@ export default function App() {
         }}
       />
 
-      {/* Viewport Culling Circle Boundary: Center = Page Center, Diameter = Page Width */}
-      <div 
-        id="viewport-culling-circle"
-        className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[100vw] h-[100vw] rounded-full border border-dashed border-blue-500/40 dark:border-blue-400/35 pointer-events-none z-0"
-      />
-
       {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.60 or during staggered DOM loading) */}
       <NanoLodCanvas
         cards={cards}
         selectedCardIds={selectedCardIds}
+        pickerSession={pickerSession}
         scale={tScale}
         tx={tx}
         ty={ty}
@@ -2581,6 +3357,11 @@ export default function App() {
         {/* Canvas Items: In Nano-LOD mode (scale < 0.60), unmount all DOM cards for ultra-fast Hybrid Canvas rendering */}
         {isDomCardsActive && visibleCards.map(card => {
           if (!renderedCardIds.has(card.id)) return null;
+          const hasImage = Boolean(card.imageUrl || card.originalImageUrl || card.thumbnailUrl);
+          const isPickerSelectable = Boolean(pickerSession && card.id !== pickerSession.targetCardId && hasImage);
+          const pickerIndex = pickerSession ? pickerSession.selectedCardIds.indexOf(card.id) : -1;
+          const pickerSelectionIndex = pickerIndex !== -1 ? pickerIndex + 1 : undefined;
+
           return (
             <GenerationCard 
               key={card.id}
@@ -2588,8 +3369,15 @@ export default function App() {
               scale={tScale}
               tx={tx}
               ty={ty}
+              isPickerTarget={pickerSession?.targetCardId === card.id}
+              isPickerSelectable={isPickerSelectable}
+              pickerSelectionIndex={pickerSelectionIndex}
+              onStartCanvasPicker={handleStartCanvasPicker}
               isSelected={selectedCardIds.includes(card.id)}
-              onSelect={handleCardSelect}
+              isZooming={isZooming}
+              allCards={cards}
+              currentProject={currentProject}
+              onSelect={handleCardSelectWrapped}
               onDrag={handleCardDrag}
               onDragEnd={handleCardDragEnd}
               onDelete={handleCardDelete}
@@ -2882,36 +3670,13 @@ export default function App() {
       </AnimatePresence>
 
       {/* Bottom Left Scale Indicator HUD */}
-      <div 
-        className="fixed bottom-6 left-6 z-50 flex items-center bg-gray-100/90 dark:bg-neutral-800/90 backdrop-blur-md border border-gray-200/80 dark:border-[#404040]/80 shadow-md rounded-[20px] corner-squircle p-1.5 gap-1 select-none"
-        onPointerDown={e => e.stopPropagation()}
-      >
-        <button
-          onClick={handleZoomOut}
-          disabled={zoomScale <= 0.101}
-          className="p-1.5 rounded-xl corner-squircle hover:bg-gray-200 dark:hover:bg-neutral-700 disabled:opacity-40 transition-colors"
-          title="缩小"
-        >
-          <Minus className="w-3.5 h-3.5 text-gray-700 dark:text-neutral-300" />
-        </button>
-        
-        <button
-          onClick={handleZoomReset}
-          className="px-2 py-1 rounded-xl corner-squircle hover:bg-gray-200 dark:hover:bg-neutral-700 transition-colors text-[11px] font-bold font-mono text-gray-800 dark:text-neutral-200 min-w-[54px] text-center"
-          title="重置到 100%"
-        >
-          {Math.round(zoomScale * 100)}%
-        </button>
-
-        <button
-          onClick={handleZoomIn}
-          disabled={zoomScale >= 4.99}
-          className="p-1.5 rounded-xl corner-squircle hover:bg-gray-200 dark:hover:bg-neutral-700 disabled:opacity-40 transition-colors"
-          title="放大"
-        >
-          <Plus className="w-3.5 h-3.5 text-gray-700 dark:text-neutral-300" />
-        </button>
-      </div>
+      <ZoomControlGroup
+        tScale={tScale}
+        isOverviewMode={isOverviewMode}
+        onZoomIn={handleZoomIn}
+        onZoomOut={handleZoomOut}
+        onZoomReset={handleZoomReset}
+      />
 
       {/* Floating Toolbar */}
       <div 
@@ -2936,6 +3701,147 @@ export default function App() {
           <Redo2 className="w-4 h-4 text-gray-700 dark:text-neutral-300" />
         </button>
       </div>
+
+      {/* Toast: Prompt to enter Overview Mode */}
+      <AnimatePresence>
+        {showOverviewPromptToast && !isOverviewMode && (
+          <motion.div
+            initial={{ opacity: 0, y: -20, scale: 0.94 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -16, scale: 0.94 }}
+            transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+            className="fixed top-5 left-1/2 -translate-x-1/2 z-[100] pointer-events-none select-none"
+          >
+            <div className="relative overflow-hidden flex items-center justify-center px-5 py-2 rounded-full bg-white/95 dark:bg-[#252528]/95 backdrop-blur-md border border-neutral-200/90 dark:border-neutral-700/80 shadow-[0_8px_30px_rgb(0,0,0,0.12)] dark:shadow-[0_8px_30px_rgb(0,0,0,0.35)] text-xs md:text-sm font-medium text-neutral-800 dark:text-neutral-100 min-w-[200px]">
+              {/* Full-bleed background progress bar from left to right */}
+              <div 
+                className="absolute inset-y-0 left-0 bg-blue-500/20 dark:bg-blue-400/25 border-r border-blue-500/50 dark:border-blue-400/50 transition-[width] duration-150 ease-out pointer-events-none"
+                style={{ width: `${Math.min(100, Math.max(0, overviewPromptProgress * 100))}%` }}
+              />
+              <span className="relative z-10 tracking-wide font-medium">继续缩小进入全景视图</span>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Top Reference Picker Control Bar & Tray (Positioned below the top toast area) */}
+      <AnimatePresence>
+        {pickerSession && (
+          <motion.div
+            initial={{ opacity: 0, y: -20, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -20, scale: 0.95 }}
+            transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+            className={`fixed ${showOverviewPromptToast && !isOverviewMode ? 'top-20' : 'top-5'} left-1/2 -translate-x-1/2 z-[110] flex flex-col items-center gap-2 w-max max-w-[98vw] select-none pointer-events-auto`}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            {/* 1. Control Bar (Main HUD Toast) */}
+            <div className="flex items-center gap-4 px-4 py-2.5 rounded-2xl bg-neutral-900/95 dark:bg-[#1a1a1d]/95 backdrop-blur-md border border-neutral-700/80 shadow-[0_16px_40px_rgba(0,0,0,0.35)] text-xs text-neutral-100">
+              <div className="flex items-center gap-2">
+                <span className="flex h-2.5 w-2.5 relative">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-blue-500"></span>
+                </span>
+                <span className="font-semibold tracking-wide text-xs">画布拾取模式</span>
+                <span className="text-neutral-500">|</span>
+                <span className="text-neutral-300">点击画布上的任意图片卡片添加/取消</span>
+              </div>
+
+              {/* Action Buttons */}
+              <div className="flex items-center gap-2 pl-3 border-l border-neutral-700">
+                <button
+                  type="button"
+                  onClick={handleCancelPickerSession}
+                  className="px-3 py-1.5 rounded-xl text-neutral-300 hover:text-white hover:bg-neutral-800 transition-colors font-medium text-xs flex items-center gap-1"
+                >
+                  <span>取消</span>
+                  <span className="text-[10px] opacity-60 bg-neutral-800 px-1 py-0.5 rounded">Esc</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleConfirmPickerSession}
+                  disabled={pickerSession.selectedCardIds.length === 0}
+                  className={`px-3.5 py-1.5 rounded-xl font-semibold text-xs flex items-center gap-1.5 transition-all shadow-sm ${
+                    pickerSession.selectedCardIds.length > 0
+                      ? 'bg-blue-600 hover:bg-blue-500 text-white cursor-pointer active:scale-95 shadow-[0_0_16px_rgba(37,99,235,0.4)]'
+                      : 'bg-neutral-800 text-neutral-500 cursor-not-allowed'
+                  }`}
+                >
+                  <span>确认导入</span>
+                  {pickerSession.selectedCardIds.length > 0 && (
+                    <span className="px-1.5 py-0.2 rounded-full bg-white/25 text-white text-[10px]">
+                      {pickerSession.selectedCardIds.length}
+                    </span>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {/* 2. Independent Reference Image Preview Tray (Positioned below Toast, Aspect-Ratio Display) */}
+            {pickerSession.selectedCardIds.length > 0 && (
+              <motion.div 
+                initial={{ opacity: 0, y: -8, scale: 0.95 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: -8, scale: 0.95 }}
+                transition={{ duration: 0.15 }}
+                className="p-2 px-3 rounded-2xl bg-neutral-950/90 backdrop-blur-md border border-neutral-800 shadow-[0_16px_36px_rgba(0,0,0,0.4)] w-fit max-w-[98vw] max-h-[34vh] overflow-y-auto scrollbar-thin"
+              >
+                <div className="flex flex-wrap items-start justify-center gap-x-4 gap-y-2">
+                  {pickerSession.selectedCardIds.map((cid, idx) => {
+                    const c = cards.find(item => item.id === cid);
+                    const img = c?.imageUrl || c?.originalImageUrl || c?.thumbnailUrl;
+                    const cardName = c?.fileName 
+                      ? c.fileName.replace(/\.[^/.]+$/, "") 
+                      : (c?.title?.trim() || c?.roleName?.trim() || (c?.prompt?.trim() ? (c.prompt.length > 14 ? c.prompt.slice(0, 14) + '…' : c.prompt) : `资产 #${idx + 1}`));
+                    return (
+                      <div 
+                        key={cid} 
+                        className="flex flex-col items-center gap-1 group flex-shrink-0 cursor-pointer"
+                        onClick={() => handleTogglePickerCard(cid)}
+                        title={`${cardName} (点击移除)`}
+                      >
+                        <div className="relative h-16 rounded-xl overflow-hidden border-2 border-blue-500 shadow-md bg-neutral-900 transition-all group-hover:scale-[1.03] group-hover:border-red-500">
+                          {img ? (
+                            <img 
+                              src={img} 
+                              alt={cardName} 
+                              className="h-full w-auto max-w-[110px] object-contain block" 
+                            />
+                          ) : (
+                            <div className="h-full w-16 bg-neutral-800 flex items-center justify-center text-xs font-bold text-neutral-300">
+                              #{idx + 1}
+                            </div>
+                          )}
+                          
+                          {/* Index badge */}
+                          <div className="absolute top-1 left-1 px-1.5 py-0.5 rounded-md bg-blue-600/90 text-[10px] text-white font-bold leading-none backdrop-blur-xs shadow-xs">
+                            {idx + 1}
+                          </div>
+
+                          {/* Hover remove overlay */}
+                          <div className="absolute inset-0 bg-red-600/80 opacity-0 group-hover:opacity-100 flex flex-col items-center justify-center transition-opacity text-white">
+                            <span className="text-sm font-bold leading-none">✕</span>
+                            <span className="text-[9px] font-medium mt-1">移除</span>
+                          </div>
+                        </div>
+
+                        {/* Name text below asset */}
+                        <span className="text-[11px] text-neutral-300 max-w-[100px] truncate text-center font-medium leading-tight group-hover:text-red-400 transition-colors">
+                          {cardName}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </motion.div>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Real-time FPS Counter */}
+      <FpsCounter hasActiveTask={!!agentTask} />
 
     </div>
   );
