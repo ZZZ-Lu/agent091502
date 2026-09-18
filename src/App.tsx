@@ -1310,14 +1310,36 @@ export default function App() {
     updateCircularCulling();
   }, [cards, selectedCardIds, updateCircularCulling]);
 
+  const [mountEpoch, setMountEpoch] = useState(0);
+
+  // Programmatic tween zooming state (active during double-click zoom or overview mode transition)
+  const [isTweenZooming, setIsTweenZooming] = useState(false);
+  const isTweenZoomingRef = useRef(false);
+  const tweenTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const triggerTweenZoom = useCallback((durationMs: number = 400) => {
+    setIsTweenZooming(true);
+    isTweenZoomingRef.current = true;
+    if (tweenTimeoutRef.current) {
+      clearTimeout(tweenTimeoutRef.current);
+    }
+    tweenTimeoutRef.current = setTimeout(() => {
+      isTweenZoomingRef.current = false;
+      setIsTweenZooming(false);
+      updateCircularCulling();
+      setMountEpoch(n => (n + 1) % 1000000);
+    }, durationMs);
+  }, [updateCircularCulling]);
+
   // High-performance batched check (via rAF) during canvas panning/zooming
   useEffect(() => {
     let rafId: number | null = null;
     const scheduleCheck = () => {
-      // Intent-driven lazy restoration: pause culling queries while actively zooming/dragging to maintain 60fps
-      if (isZoomingRef.current || isDraggingCanvasRef.current || (window as any).isDraggingCard) {
+      // Pause culling updates during programmatic tween zooms (double-click & overview transitions)
+      if (isTweenZoomingRef.current) {
         return;
       }
+      // Real-time culling updates throttled via rAF during manual user interaction (wheel, drag)
       if (rafId === null) {
         rafId = requestAnimationFrame(() => {
           rafId = null;
@@ -1378,7 +1400,6 @@ export default function App() {
 
   // Set of DOM-mounted card IDs (asynchronous frame-budgeted progressive mounting)
   const [renderedCardIds, setRenderedCardIds] = useState<Set<string>>(() => new Set());
-  const [mountEpoch, setMountEpoch] = useState(0);
 
   const handleCardDrag = useCallback((id: string, dx: number, dy: number) => {
     // No-op. Real-time dragging is now fully handled in DOM by GenerationCard.tsx (Master-Slave architecture).
@@ -2427,6 +2448,8 @@ export default function App() {
     resetOverviewPrompt();
     if (isOverviewModeRef.current) return;
 
+    triggerTweenZoom(400);
+
     // Save current transform state to revert if needed
     if (!preOverviewTransform.current) {
       preOverviewTransform.current = {
@@ -2495,6 +2518,7 @@ export default function App() {
   const exitOverviewToOriginal = useCallback(() => {
     resetOverviewPrompt();
     if (preOverviewTransform.current) {
+      triggerTweenZoom(400);
       const { x, y, scale } = preOverviewTransform.current;
       targetTransform.current = { x, y, scale };
       
@@ -2510,7 +2534,7 @@ export default function App() {
     }
     setIsOverviewMode(false);
     isOverviewModeRef.current = false;
-  }, [tScale, tx, ty, restoreCanvasStyles, resetOverviewPrompt]);
+  }, [tScale, tx, ty, restoreCanvasStyles, resetOverviewPrompt, triggerTweenZoom]);
 
   enterOverviewModeRef.current = enterOverviewMode;
   exitOverviewToOriginalRef.current = exitOverviewToOriginal;
@@ -2523,6 +2547,8 @@ export default function App() {
 
     const prevScale = tScale.get();
     if (Math.abs(prevScale - newScale) < 0.001) return;
+    
+    triggerTweenZoom(220);
     
     // 1. Degrade styles during active animation to keep frames buttery smooth (Intent-Driven Lazy Restoration)
     const workspace = document.getElementById('canvas-workspace');
@@ -2633,14 +2659,32 @@ export default function App() {
     }
 
     // Direct Double Click Zoom Toggle:
-    // If zoomed in (scale >= 0.20), zoom directly out to 10% (0.1) anchored at the exact mouse cursor position
-    // If zoomed out (scale < 0.20), zoom directly into 100% (1.0) anchored at the exact mouse cursor position
-    if (currentScale >= 0.20) {
+    // 1. If zoomed in past 100% (scale > 1.001), zoom directly back to 100% (1.0) anchored at the mouse cursor
+    // 2. If at normal zoom (0.20 <= scale <= 1.001), zoom directly out to 10% (0.1) anchored at the mouse cursor
+    // 3. If zoomed out (scale < 0.20), zoom directly into 100% (1.0) anchored at the mouse cursor
+    if (currentScale > 1.001) {
+      const targetScale = 1.0;
+      const targetTx = cursorX - worldX * targetScale;
+      const targetTy = cursorY - worldY * targetScale;
+
+      targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
+
+      triggerTweenZoom(360);
+
+      clearTimeout(zoomTimeoutRef.current);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 150);
+
+      animate(tScale, targetScale, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
+      animate(tx, targetTx, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
+      animate(ty, targetTy, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
+    } else if (currentScale >= 0.20) {
       const targetScale = 0.1;
       const targetTx = cursorX - worldX * targetScale;
       const targetTy = cursorY - worldY * targetScale;
 
       targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
+
+      triggerTweenZoom(400);
 
       clearTimeout(zoomTimeoutRef.current);
       zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 2000);
@@ -2656,6 +2700,8 @@ export default function App() {
 
       targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
 
+      triggerTweenZoom(360);
+
       clearTimeout(zoomTimeoutRef.current);
       zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 150);
 
@@ -2663,7 +2709,7 @@ export default function App() {
       animate(tx, targetTx, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
       animate(ty, targetTy, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
     }
-  }, [tScale, tx, ty, restoreCanvasStyles]);
+  }, [tScale, tx, ty, restoreCanvasStyles, triggerTweenZoom]);
 
     useEffect(() => {
     const container = containerRef.current;
@@ -2714,6 +2760,8 @@ export default function App() {
           const targetTy = cursorY - worldY * targetScale;
 
           targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
+
+          triggerTweenZoom(400);
 
           const animConfig: any = { type: 'tween', duration: 0.4, ease: [0.16, 1, 0.3, 1] };
           animate(tScale, targetScale, animConfig);
@@ -2845,6 +2893,8 @@ export default function App() {
       const targetTy = clickY - worldY * targetScale;
       
       targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
+      
+      triggerTweenZoom(400);
       
       const animConfig: any = { type: 'tween', duration: 0.4, ease: [0.16, 1, 0.3, 1] };
       animate(tScale, targetScale, animConfig);
@@ -3084,8 +3134,8 @@ export default function App() {
       return;
     }
 
-    // While user is actively zooming or dragging, strictly freeze DOM mounts for 60fps GPU smoothness
-    if (isZooming || isDraggingCanvasRef.current) {
+    // Freeze DOM card mounting during double-click or overview transition tween until landing
+    if (isTweenZooming) {
       return;
     }
 
@@ -3113,8 +3163,7 @@ export default function App() {
     let rafId: number;
 
     const mountStep = () => {
-      // Re-check interaction flag: if user started zooming/dragging during the rAF, abort immediately
-      if (isZoomingRef.current || isDraggingCanvasRef.current || (window as any).isDraggingCard) {
+      if (isTweenZoomingRef.current) {
         return;
       }
 
@@ -3162,7 +3211,7 @@ export default function App() {
     return () => {
       cancelAnimationFrame(rafId);
     };
-  }, [isDomCardsActive, isZooming, mountEpoch, visibleCards, renderedCardIds, tx, ty, tScale]);
+  }, [isDomCardsActive, isTweenZooming, mountEpoch, visibleCards, renderedCardIds, tx, ty, tScale]);
 
   return (
     <div 
@@ -3192,6 +3241,8 @@ export default function App() {
           const targetTy = clickY - worldY * targetScale;
           
           targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
+          
+          triggerTweenZoom(400);
           
           const animConfig: any = { type: 'tween', duration: 0.4, ease: [0.16, 1, 0.3, 1] };
           animate(tScale, targetScale, animConfig);
