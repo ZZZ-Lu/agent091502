@@ -4,6 +4,7 @@ import { createServer as createViteServer } from "vite";
 import fs from "fs";
 import dotenv from "dotenv";
 import { AGENT_TOOL_REGISTRY } from './src/agent/toolRegistry';
+import { mcpRouter } from './src/server/mcpRouter';
 dotenv.config();
 const defaultPromptFilePath = path.join(process.cwd(), "src/agent/systemPrompt.txt");
 const customPromptDir = path.join(process.cwd(), ".data");
@@ -207,6 +208,10 @@ async function startServer() {
   const PORT = 3000;
 
   app.use(express.json({ limit: '10mb' }));
+
+  // WorkRally MCP Proxy Routes
+  app.use('/api/mcp/workrally', mcpRouter);
+  app.use('/api/mcp', mcpRouter);
 
   // API Route for AI Episode / TOC Pattern Recognition
   app.post('/api/save-prompts', express.json(), (req, res) => {

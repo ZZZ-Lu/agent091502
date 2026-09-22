@@ -58,6 +58,18 @@
   scrollbar-color: rgba(156, 163, 175, 0.35) transparent;
 }
 
+/* Invisible scrollbar utility to ensure 100% width matching between overlays */
+.no-scrollbar::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none !important;
+  scrollbar-width: none !important;
+}
+
 .dark * {
   scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
 }
@@ -72,3 +84,88 @@
   transition-duration: 600ms !important;
   transition-timing-function: ease-in-out !important;
 }
+
+/* 4K Performance & Intent-Driven Lazy Degradation:
+   Aggressively strip heavy DOM rendering and expensive CSS effects during active zooming/panning for Asset Cards & Generation Cards */
+#canvas-workspace[data-zooming="true"],
+#canvas-workspace[data-panning="true"],
+#canvas-workspace[data-gesture="true"] {
+  pointer-events: none !important;
+}
+
+#canvas-workspace[data-zooming="true"] .asset-card,
+#canvas-workspace[data-panning="true"] .asset-card,
+#canvas-workspace[data-gesture="true"] .asset-card,
+#canvas-workspace[data-zooming="true"] .generation-card,
+#canvas-workspace[data-panning="true"] .generation-card,
+#canvas-workspace[data-gesture="true"] .generation-card {
+  box-shadow: none !important;
+  filter: none !important;
+  backdrop-filter: none !important;
+  transition: none !important;
+}
+
+#canvas-workspace[data-zooming="true"] .generation-card *,
+#canvas-workspace[data-panning="true"] .generation-card *,
+#canvas-workspace[data-gesture="true"] .generation-card * {
+  box-shadow: none !important;
+  filter: none !important;
+  backdrop-filter: none !important;
+  transition: none !important;
+}
+
+#canvas-workspace[data-zooming="true"] .asset-card .squircle,
+#canvas-workspace[data-panning="true"] .asset-card .squircle,
+#canvas-workspace[data-gesture="true"] .asset-card .squircle,
+#canvas-workspace[data-zooming="true"] .generation-card .squircle,
+#canvas-workspace[data-panning="true"] .generation-card .squircle,
+#canvas-workspace[data-gesture="true"] .generation-card .squircle {
+  border-radius: 4px !important;
+  corner-shape: unset !important;
+  box-shadow: none !important;
+}
+
+#canvas-workspace[data-zooming="true"] .ref-thumb-tag,
+#canvas-workspace[data-panning="true"] .ref-thumb-tag,
+#canvas-workspace[data-gesture="true"] .ref-thumb-tag {
+  opacity: 0 !important;
+  transition: none !important;
+}
+
+/* Video GPU Compositor Optimization during canvas motion:
+   Instantly unbind and hide hardware video layers during zoom, pan, or gesture */
+#canvas-workspace[data-zooming="true"] video,
+#canvas-workspace[data-panning="true"] video,
+#canvas-workspace[data-gesture="true"] video {
+  opacity: 0 !important;
+  visibility: hidden !important;
+  transition: none !important;
+  pointer-events: none !important;
+}
+
+#canvas-workspace video {
+  transition: opacity 0.5s ease-out;
+}
+
+/* Asset Card Header Tags (Filename & Resolution Badge):
+   - Upgrading (restoring to full LOD / idle): Gentle fade-in transition with 0.5s duration.
+   - Degrading (gesturing / zooming / panning / micro-LOD): Instant disappearance with 0s duration (no animation). */
+.asset-heavy-dom {
+  opacity: 1;
+  transition: opacity 0.5s ease-out;
+}
+
+#canvas-workspace[data-zooming="true"] .asset-heavy-dom,
+#canvas-workspace[data-panning="true"] .asset-heavy-dom,
+#canvas-workspace[data-gesture="true"] .asset-heavy-dom,
+#canvas-workspace[data-scale-micro="true"] .asset-heavy-dom {
+  opacity: 0 !important;
+  transition: none !important;
+  pointer-events: none !important;
+}
+
+/* Custom Map Marker Cursor for Overview Mode */
+.overview-cursor {
+  cursor: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2232%22%20height%3D%2232%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22%233b82f6%22%20stroke%3D%22white%22%20stroke-width%3D%221.5%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M12%202C8.13%202%205%205.13%205%209c0%205.25%207%2013%207%2013s7-7.75%207-13c0-3.87-3.13-7-7-7z%22%2F%3E%3Ccircle%20cx%3D%2212%22%20cy%3D%229%22%20r%3D%222.5%22%20fill%3D%22white%22%2F%3E%3C%2Fsvg%3E") 16 30, auto !important;
+}
+

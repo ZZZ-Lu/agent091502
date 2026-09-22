@@ -4,12 +4,13 @@ import { AgentContextMenu } from './components/AgentContextMenu';
 import { GenerationCard, CardData, CARD_DIMENSIONS, getCardSize } from './components/GenerationCard';
 import { NanoLodCanvas } from './components/NanoLodCanvas';
 import { FpsCounter } from './components/FpsCounter';
-import { generateImageThumbnail, generateVideoThumbnail, getOrCreateMediaThumbnail, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
+import { generateImageThumbnail, generateVideoThumbnail, getOrCreateMediaThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
 import { fastGetImageDimensions } from './utils/imageHeader';
-import { isCardIntersectingRectangle, getLodMountQuota } from './utils/viewportCulling';
-import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X } from 'lucide-react';
+import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold } from './utils/viewportCulling';
+import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick } from 'lucide-react';
 import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
 import { SettingsPage } from './components/SettingsPage';
+import { McpKeyButton } from './components/McpKeyButton';
 import { ProjectScriptBible } from './components/ProjectScriptBible';
 import { ScriptProject, DEFAULT_PROJECT } from './types/script';
 import { ScriptView } from './agent/scriptTools';
@@ -230,7 +231,7 @@ const ZoomControlGroup: React.FC<{
   const pct = Math.round(scaleVal * 100);
   let text = "";
   let colorClass = "";
-  if (pct < 60) {
+  if (pct < 40) {
     text = "远景";
     colorClass = "text-blue-500 dark:text-blue-400";
   } else if (pct < 100) {
@@ -368,6 +369,7 @@ export default function App() {
   const [isOverviewMode, setIsOverviewMode] = useState(false);
   const isOverviewModeRef = useRef(false);
   const preOverviewTransform = useRef<{ x: number, y: number, scale: number } | null>(null);
+  const [overviewViewportBox, setOverviewViewportBox] = useState<{ x: number, y: number, width: number, height: number } | null>(null);
   const isSpacePressedRef = useRef(false);
   const wheelZoomOutAccumulatorRef = useRef(0);
   const [showOverviewPromptToast, setShowOverviewPromptToast] = useState(false);
@@ -376,6 +378,15 @@ export default function App() {
   const resetOverviewPromptRef = useRef<() => void>(() => {});
   const enterOverviewModeRef = useRef<() => void>(() => {});
   const exitOverviewToOriginalRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    if (!isOverviewMode) {
+      const timer = setTimeout(() => {
+        setOverviewViewportBox(null);
+      }, 420);
+      return () => clearTimeout(timer);
+    }
+  }, [isOverviewMode]);
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', isDarkMode);
@@ -488,6 +499,20 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const updatePointer = (e: MouseEvent | PointerEvent | WheelEvent) => {
+      (window as any).__lastMousePos = { x: e.clientX, y: e.clientY };
+    };
+    window.addEventListener('pointermove', updatePointer, { passive: true, capture: true });
+    window.addEventListener('pointerdown', updatePointer, { passive: true, capture: true });
+    window.addEventListener('wheel', updatePointer, { passive: true, capture: true });
+    return () => {
+      window.removeEventListener('pointermove', updatePointer, true);
+      window.removeEventListener('pointerdown', updatePointer, true);
+      window.removeEventListener('wheel', updatePointer, true);
+    };
+  }, []);
+
+  useEffect(() => {
     scriptViewRef.current = {
       drawerOpen: isScriptDrawerOpen,
       tocOpen: isScriptTocOpen,
@@ -548,6 +573,8 @@ export default function App() {
   const [isDragging, setIsDragging] = useState(false);
   const [isZooming, setIsZooming] = useState(false);
   const isZoomingRef = useRef(false);
+  const isZoomAnimationActiveRef = useRef(false);
+  const [isZoomAnimationActive, setIsZoomAnimationActive] = useState(false);
   const zoomTimeoutRef = useRef<NodeJS.Timeout>();
   const doubleClickTimeoutRef = useRef<NodeJS.Timeout>();
   const lastPointer = useRef({ x: 0, y: 0 });
@@ -627,7 +654,12 @@ export default function App() {
   // Canvas Reference Picker Session State
   const [pickerSession, setPickerSession] = useState<{
     targetCardId: string;
-    selectedCardIds: string[];
+    selectedReferences: Array<{
+      url: string;
+      name?: string;
+      fileData?: Blob;
+      sourceCardId?: string;
+    }>;
     initialCamera: { x: number; y: number; scale: number };
   } | null>(null);
   const pickerSessionRef = useRef(pickerSession);
@@ -823,11 +855,20 @@ export default function App() {
       const processedFileUrl = URL.createObjectURL(processedFile);
 
       let thumbnailUrl: string | undefined;
+      let microLodThumbnailUrl: string | undefined;
+      let fullDetailThumbnailUrl: string | undefined;
+      let closeupThumbnailUrl: string | undefined;
       try {
         if (isVideo) {
-          thumbnailUrl = await generateVideoThumbnail(processedFile, MAX_THUMBNAIL_EDGE);
+          closeupThumbnailUrl = await generateVideoThumbnail(processedFile, 256);
+          thumbnailUrl = closeupThumbnailUrl;
+          microLodThumbnailUrl = await generateVideoThumbnail(processedFile, 64);
+          fullDetailThumbnailUrl = await generateVideoThumbnail(processedFile, 128);
         } else {
-          thumbnailUrl = await generateImageThumbnail(processedFile, MAX_THUMBNAIL_EDGE);
+          closeupThumbnailUrl = await generateImageThumbnail(processedFile, 256);
+          thumbnailUrl = closeupThumbnailUrl;
+          microLodThumbnailUrl = await generateImageThumbnail(processedFile, 64);
+          fullDetailThumbnailUrl = await generateImageThumbnail(processedFile, 128);
         }
       } catch (thumbErr) {
         console.warn('Could not pre-generate thumbnail on drop:', thumbErr);
@@ -844,6 +885,9 @@ export default function App() {
         originalImageUrl: originalImageUrl,
         trueOriginalImageUrl: trueOriginalImageUrl,
         thumbnailUrl: thumbnailUrl,
+        microLodThumbnailUrl: microLodThumbnailUrl,
+        fullDetailThumbnailUrl: fullDetailThumbnailUrl,
+        closeupThumbnailUrl: closeupThumbnailUrl,
       } : c));
     });
   }, [tx, ty, tScale]);
@@ -1106,10 +1150,13 @@ export default function App() {
     return () => { mounted = false; };
   }, [currentProjectId]);
 
-  // Save cards to IndexedDB for current project ONLY when cards belong to current project
+  // Save cards to IndexedDB for current project ONLY when cards belong to current project (debounced)
   useEffect(() => {
     if (!isLoading && currentProjectId && loadedProjectIdRef.current === currentProjectId) {
-      saveCards(cards, currentProjectId).catch(console.error);
+      const timer = setTimeout(() => {
+        saveCards(cards, currentProjectId).catch(console.error);
+      }, 400);
+      return () => clearTimeout(timer);
     }
   }, [cards, isLoading, currentProjectId]);
 
@@ -1134,18 +1181,28 @@ export default function App() {
       : targetCard?.referenceImageUrl
         ? [{ url: targetCard.referenceImageUrl, name: targetCard.referenceImageName, fileData: targetCard.referenceImageFileData }]
         : [];
-    const existingUrls = new Set(existingRefs.map(r => r.url).filter(Boolean));
-    
-    const initialSelectedCardIds = cards
-      .filter(c => {
-        const img = c.imageUrl || c.originalImageUrl || c.thumbnailUrl;
-        return img && existingUrls.has(img);
-      })
-      .map(c => c.id);
+
+    // Create a fast map of card image URLs to card IDs
+    const canvasCardUrlMap = new Map<string, string>();
+    cards.forEach(c => {
+      if (c.imageUrl) canvasCardUrlMap.set(c.imageUrl, c.id);
+      if (c.originalImageUrl) canvasCardUrlMap.set(c.originalImageUrl, c.id);
+      if (c.thumbnailUrl) canvasCardUrlMap.set(c.thumbnailUrl, c.id);
+    });
+
+    // Backfill sourceCardId if missing but matches a canvas card URL
+    const populatedRefs = existingRefs.map(ref => {
+      if (ref.sourceCardId) return ref;
+      const matchedId = canvasCardUrlMap.get(ref.url);
+      if (matchedId) {
+        return { ...ref, sourceCardId: matchedId };
+      }
+      return ref;
+    });
 
     setPickerSession({
       targetCardId,
-      selectedCardIds: initialSelectedCardIds,
+      selectedReferences: populatedRefs,
       initialCamera: currentCamera
     });
   }, [tx, ty, tScale, cards]);
@@ -1155,103 +1212,62 @@ export default function App() {
     setPickerSession(prev => {
       if (!prev) return null;
       if (prev.targetCardId === cardId) return prev; // Cannot pick target itself
-      const isSelected = prev.selectedCardIds.includes(cardId);
-      const nextSelected = isSelected
-        ? prev.selectedCardIds.filter(id => id !== cardId)
-        : [...prev.selectedCardIds, cardId];
-      return { ...prev, selectedCardIds: nextSelected };
+      
+      const targetCardObj = cardsRef.current.find(c => c.id === cardId);
+      if (!targetCardObj) return prev;
+
+      const isSelected = prev.selectedReferences.some(ref => 
+        ref.sourceCardId === cardId || 
+        (ref.url && (
+          ref.url === targetCardObj.imageUrl || 
+          ref.url === targetCardObj.originalImageUrl || 
+          ref.url === targetCardObj.thumbnailUrl
+        ))
+      );
+
+      let nextRefs;
+      if (isSelected) {
+        // Remove from reference list
+        nextRefs = prev.selectedReferences.filter(ref => 
+          ref.sourceCardId !== cardId && 
+          (!ref.url || (
+            ref.url !== targetCardObj.imageUrl && 
+            ref.url !== targetCardObj.originalImageUrl && 
+            ref.url !== targetCardObj.thumbnailUrl
+          ))
+        );
+      } else {
+        // Add to reference list
+        const thumbUrl = targetCardObj.thumbnailUrl || thumbCache.get(cardId) || (targetCardObj.imageUrl ? thumbCache.get(targetCardObj.imageUrl) : undefined);
+        const newRef = {
+          sourceCardId: cardId,
+          url: targetCardObj.imageUrl || targetCardObj.originalImageUrl || targetCardObj.thumbnailUrl || '',
+          thumbnailUrl: thumbUrl,
+          microLodThumbnailUrl: targetCardObj.microLodThumbnailUrl,
+          fullDetailThumbnailUrl: targetCardObj.fullDetailThumbnailUrl,
+          closeupThumbnailUrl: targetCardObj.closeupThumbnailUrl,
+          name: targetCardObj.fileName 
+            ? targetCardObj.fileName.replace(/\.[^/.]+$/, "") 
+            : (targetCardObj.prompt 
+              ? (targetCardObj.prompt.length > 14 ? targetCardObj.prompt.slice(0, 14) + '...' : targetCardObj.prompt) 
+              : '画布卡片'),
+          fileData: targetCardObj.trueOriginalFileData || targetCardObj.originalFileData || targetCardObj.fileData
+        };
+        nextRefs = [...prev.selectedReferences, newRef];
+      }
+
+      return { ...prev, selectedReferences: nextRefs };
     });
   }, []);
 
-  // Cancel picker session and fly back
-  const handleCancelPickerSession = useCallback(() => {
-    if (!pickerSession) return;
-    const { initialCamera } = pickerSession;
-    
-    // Sync the virtual camera target position to prevent wheel jump
-    targetTransform.current = {
-      x: initialCamera.x,
-      y: initialCamera.y,
-      scale: initialCamera.scale
-    };
-
-    // Animate smoothly back to initial camera
-    animate(tx, initialCamera.x, { duration: 0.4, ease: [0.16, 1, 0.3, 1] });
-    animate(ty, initialCamera.y, { duration: 0.4, ease: [0.16, 1, 0.3, 1] });
-    animate(tScale, initialCamera.scale, { duration: 0.4, ease: [0.16, 1, 0.3, 1] });
-    setPickerSession(null);
-  }, [pickerSession, tx, ty, tScale]);
-
-  // Confirm picker session and apply reference images
-  const handleConfirmPickerSession = useCallback(() => {
-    if (!pickerSession) return;
-    const { targetCardId, selectedCardIds, initialCamera } = pickerSession;
-    
-    if (selectedCardIds.length > 0) {
-      const targetCard = cardsRef.current.find(c => c.id === targetCardId);
-      const pickedCards = cardsRef.current.filter(c => selectedCardIds.includes(c.id));
-      
-      const newReferences = pickedCards.map(c => ({
-        url: c.imageUrl || c.originalImageUrl || c.thumbnailUrl || '',
-        name: c.fileName ? c.fileName.replace(/\.[^/.]+$/, "") : (c.prompt ? (c.prompt.length > 14 ? c.prompt.slice(0, 14) + '...' : c.prompt) : '画布卡片'),
-        fileData: c.trueOriginalFileData || c.originalFileData || c.fileData
-      })).filter(r => Boolean(r.url));
-
-      const existingRefs = targetCard?.referenceImages && targetCard.referenceImages.length > 0
-        ? targetCard.referenceImages
-        : targetCard?.referenceImageUrl
-          ? [{ url: targetCard.referenceImageUrl, name: targetCard.referenceImageName, fileData: targetCard.referenceImageFileData }]
-          : [];
-
-      // Preserve existing non-canvas references (e.g., raw local uploads directly to card)
-      const canvasCardUrls = new Set(cardsRef.current.map(c => c.imageUrl || c.originalImageUrl || c.thumbnailUrl).filter(Boolean));
-      const nonCanvasRefs = existingRefs.filter(ref => !canvasCardUrls.has(ref.url));
-
-      const mergedRefs = [...nonCanvasRefs, ...newReferences];
-      
-      if (mergedRefs.length > 0) {
-        handleUpdateCard(targetCardId, {
-          referenceImages: mergedRefs,
-          referenceImageUrl: mergedRefs[0].url,
-          referenceImageName: mergedRefs.length > 1 ? `参考图 (${mergedRefs.length})` : mergedRefs[0].name,
-          referenceImageFileData: mergedRefs[0].fileData
-        }, true);
-      } else {
-        handleUpdateCard(targetCardId, {
-          referenceImages: [],
-          referenceImageUrl: null,
-          referenceImageName: undefined,
-          referenceImageFileData: undefined
-        }, true);
-      }
-    } else {
-      // If all selections are removed, clear reference images on the card
-      handleUpdateCard(targetCardId, {
-        referenceImages: [],
-        referenceImageUrl: null,
-        referenceImageName: undefined,
-        referenceImageFileData: undefined
-      }, true);
-    }
-
-    // Cinematic fly back to target card position
-    const targetCard = cardsRef.current.find(c => c.id === targetCardId);
-    const finalX = targetCard ? -targetCard.x * initialCamera.scale + window.innerWidth / 2 - (CARD_DIMENSIONS[targetCard.ratio]?.width || 320) * initialCamera.scale / 2 : initialCamera.x;
-    const finalY = targetCard ? -targetCard.y * initialCamera.scale + window.innerHeight / 2 - (CARD_DIMENSIONS[targetCard.ratio]?.height || 320) * initialCamera.scale / 2 : initialCamera.y;
-
-    // Sync the virtual camera target position to prevent wheel jump
-    targetTransform.current = {
-      x: finalX,
-      y: finalY,
-      scale: initialCamera.scale
-    };
-
-    animate(tx, finalX, { duration: 0.45, ease: [0.16, 1, 0.3, 1] });
-    animate(ty, finalY, { duration: 0.45, ease: [0.16, 1, 0.3, 1] });
-    animate(tScale, initialCamera.scale, { duration: 0.45, ease: [0.16, 1, 0.3, 1] });
-
-    setPickerSession(null);
-  }, [pickerSession, handleUpdateCard, tx, ty, tScale]);
+  // Remove a picker reference by direct index from the tray
+  const handleRemovePickerReference = useCallback((indexToRemove: number) => {
+    setPickerSession(prev => {
+      if (!prev) return null;
+      const nextRefs = prev.selectedReferences.filter((_, idx) => idx !== indexToRemove);
+      return { ...prev, selectedReferences: nextRefs };
+    });
+  }, []);
 
   const selectedCardIdsRef = useRef(selectedCardIds);
   useEffect(() => {
@@ -1331,15 +1347,76 @@ export default function App() {
     }, durationMs);
   }, [updateCircularCulling]);
 
+  // Cancel picker session and fly back
+  const handleCancelPickerSession = useCallback(() => {
+    if (!pickerSession) return;
+    const { initialCamera } = pickerSession;
+    
+    // Freeze rendering and layout updates during flight
+    triggerTweenZoom(450);
+
+    // Sync the virtual camera target position to prevent wheel jump
+    targetTransform.current = {
+      x: initialCamera.x,
+      y: initialCamera.y,
+      scale: initialCamera.scale
+    };
+
+    // Animate smoothly back to initial camera
+    animate(tx, initialCamera.x, { duration: 0.4, ease: [0.16, 1, 0.3, 1] });
+    animate(ty, initialCamera.y, { duration: 0.4, ease: [0.16, 1, 0.3, 1] });
+    animate(tScale, initialCamera.scale, { duration: 0.4, ease: [0.16, 1, 0.3, 1] });
+    setPickerSession(null);
+  }, [pickerSession, tx, ty, tScale, triggerTweenZoom]);
+
+  // Confirm picker session and apply reference images
+  const handleConfirmPickerSession = useCallback(() => {
+    if (!pickerSession) return;
+    const { targetCardId, selectedReferences, initialCamera } = pickerSession;
+    
+    // Freeze rendering and layout updates during flight
+    triggerTweenZoom(450);
+
+    if (selectedReferences.length > 0) {
+      handleUpdateCard(targetCardId, {
+        referenceImages: selectedReferences,
+        referenceImageUrl: selectedReferences[0].url,
+        referenceImageName: selectedReferences.length > 1 ? `参考图 (${selectedReferences.length})` : selectedReferences[0].name,
+        referenceImageFileData: selectedReferences[0].fileData
+      }, true);
+    } else {
+      handleUpdateCard(targetCardId, {
+        referenceImages: [],
+        referenceImageUrl: null,
+        referenceImageName: undefined,
+        referenceImageFileData: undefined
+      }, true);
+    }
+
+    // Cinematic fly back to target card position
+    const targetCard = cardsRef.current.find(c => c.id === targetCardId);
+    const finalX = targetCard ? -targetCard.x * initialCamera.scale + window.innerWidth / 2 - (CARD_DIMENSIONS[targetCard.ratio]?.width || 320) * initialCamera.scale / 2 : initialCamera.x;
+    const finalY = targetCard ? -targetCard.y * initialCamera.scale + window.innerHeight / 2 - (CARD_DIMENSIONS[targetCard.ratio]?.height || 320) * initialCamera.scale / 2 : initialCamera.y;
+
+    // Sync the virtual camera target position to prevent wheel jump
+    targetTransform.current = {
+      x: finalX,
+      y: finalY,
+      scale: initialCamera.scale
+    };
+
+    animate(tx, finalX, { duration: 0.45, ease: [0.16, 1, 0.3, 1] });
+    animate(ty, finalY, { duration: 0.45, ease: [0.16, 1, 0.3, 1] });
+    animate(tScale, initialCamera.scale, { duration: 0.45, ease: [0.16, 1, 0.3, 1] });
+
+    setPickerSession(null);
+  }, [pickerSession, handleUpdateCard, tx, ty, tScale, triggerTweenZoom]);
+
   // High-performance batched check (via rAF) during canvas panning/zooming
   useEffect(() => {
     let rafId: number | null = null;
     const scheduleCheck = () => {
-      // Pause culling updates during programmatic tween zooms (double-click & overview transitions)
-      if (isTweenZoomingRef.current) {
-        return;
-      }
-      // Real-time culling updates throttled via rAF during manual user interaction (wheel, drag)
+      // Real-time culling updates throttled via rAF during manual user interaction (wheel, drag) & smooth zoom animations
       if (rafId === null) {
         rafId = requestAnimationFrame(() => {
           rafId = null;
@@ -1360,14 +1437,14 @@ export default function App() {
     };
   }, [tx, ty, tScale, updateCircularCulling]);
 
-  // Micro-LOD state tracking (scale < 0.60)
-  const [isMicroLod, setIsMicroLod] = useState(() => tScale.get() < 0.60);
-  // Nano-LOD state tracking (scale < 0.60)
-  const [isNanoLod, setIsNanoLod] = useState(() => tScale.get() < 0.60);
+  // Micro-LOD state tracking (scale < dynamic threshold)
+  const [isMicroLod, setIsMicroLod] = useState(() => tScale.get() < getNanoLodThreshold());
+  // Nano-LOD state tracking (scale < dynamic threshold)
+  const [isNanoLod, setIsNanoLod] = useState(() => tScale.get() < getNanoLodThreshold());
   // Extended Nano-LOD state to act as a backend backdrop during DOM card fade-in
-  const [isNanoCanvasActive, setIsNanoCanvasActive] = useState(() => tScale.get() < 0.60);
+  const [isNanoCanvasActive, setIsNanoCanvasActive] = useState(() => tScale.get() < getNanoLodThreshold());
   // Extended DOM card state to act as a frontend backdrop while Canvas prepares to render
-  const [isDomCardsActive, setIsDomCardsActive] = useState(() => tScale.get() >= 0.60);
+  const [isDomCardsActive, setIsDomCardsActive] = useState(() => tScale.get() >= getNanoLodThreshold());
 
   const handleNanoCanvasReady = useCallback(() => {
     if (isNanoLod) {
@@ -1389,8 +1466,9 @@ export default function App() {
 
   useEffect(() => {
     const unsub = tScale.on('change', (s) => {
-      const isMicro = s < 0.60;
-      const isNano = s < 0.60;
+      const threshold = getNanoLodThreshold();
+      const isMicro = s < threshold;
+      const isNano = s < threshold;
       
       setIsMicroLod(isMicro);
       setIsNanoLod(isNano);
@@ -1421,20 +1499,31 @@ export default function App() {
     }, true);
   }, []);
 
-  const handleCardSelect = useCallback((e: React.PointerEvent, id: string) => {
+  const handleCardSelect = useCallback((e: React.PointerEvent, id: string, selectOnlyOnPointerUp?: boolean) => {
     setContextMenus(prev => {
       const next = { ...prev };
       delete next['user'];
       return next;
     });
     if (e.shiftKey || e.ctrlKey || e.metaKey) {
-      setSelectedCardIds(prev => prev.includes(id) ? prev.filter(cid => cid !== id) : [...prev, id]);
+      if (!selectOnlyOnPointerUp) {
+        setSelectedCardIds(prev => prev.includes(id) ? prev.filter(cid => cid !== id) : [...prev, id]);
+      }
     } else {
-      setSelectedCardIds(prev => (prev.length === 1 && prev[0] === id) ? prev : [id]);
+      if (selectOnlyOnPointerUp) {
+        setSelectedCardIds([id]);
+      } else {
+        setSelectedCardIds(prev => {
+          if (prev.includes(id)) {
+            return prev;
+          }
+          return [id];
+        });
+      }
     }
   }, []);
 
-  const handleCardSelectWrapped = useCallback((e: React.PointerEvent, id: string) => {
+  const handleCardSelectWrapped = useCallback((e: React.PointerEvent, id: string, selectOnlyOnPointerUp?: boolean) => {
     const session = pickerSessionRef.current;
     if (session) {
       if (id !== session.targetCardId) {
@@ -1442,7 +1531,7 @@ export default function App() {
         handleTogglePickerCard(id);
       }
     } else {
-      handleCardSelect(e, id);
+      handleCardSelect(e, id, selectOnlyOnPointerUp);
     }
   }, [handleCardSelect, handleTogglePickerCard]);
 
@@ -2404,34 +2493,30 @@ export default function App() {
     
     // Restore accurate LOD states now that the user has stopped zooming or dragging
     const currentScale = tScale.get();
-    setIsMicroLod(currentScale < 0.60);
-    setIsNanoLod(currentScale < 0.60);
+    const threshold = getNanoLodThreshold();
+    setIsMicroLod(currentScale < threshold);
+    setIsNanoLod(currentScale < threshold);
     setMountEpoch(n => (n + 1) % 1000000);
     
     const workspace = document.getElementById('canvas-workspace');
     if (workspace) {
-      if (workspace.getAttribute('data-zooming') === 'true') {
-        // 2. Bypass transition storm: Instantly restore styles without CSS interpolation (Fixes end stutter)
-        workspace.style.transition = 'none';
-        workspace.setAttribute('data-zooming', 'false');
-        isZoomingRef.current = false;
-        setIsZooming(false); // MUST sync React state so it doesn't revert on next render
-        void workspace.offsetHeight;
-        requestAnimationFrame(() => {
-          workspace.style.transition = '';
-        });
-      }
+      workspace.removeAttribute('data-zooming');
+      workspace.removeAttribute('data-panning');
+      workspace.removeAttribute('data-gesture');
+      isZoomingRef.current = false;
+      setIsZooming(false); // MUST sync React state so it doesn't revert on next render
+      window.dispatchEvent(new CustomEvent('canvas-styles-restored'));
     }
   }, [updateCircularCulling, tScale]);
 
   useEffect(() => {
     (window as any).resetGlobalZoomTimer = () => {
       clearTimeout(zoomTimeoutRef.current);
-      const idleDelay = tScale.get() >= 0.60 ? 150 : 2000;
+      const idleDelay = 300;
       zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, idleDelay);
     };
     return () => { delete (window as any).resetGlobalZoomTimer; };
-  }, [restoreCanvasStyles, tScale]);
+  }, [restoreCanvasStyles]);
 
   const resetOverviewPrompt = useCallback(() => {
     wheelZoomOutAccumulatorRef.current = 0;
@@ -2462,6 +2547,19 @@ export default function App() {
     const container = containerRef.current;
     if (!container) return;
     const rect = container.getBoundingClientRect();
+    
+    // Record original viewport box in world space at the moment overview is triggered
+    const origTransform = preOverviewTransform.current || targetTransform.current;
+    const originWorldX = (0 - origTransform.x) / origTransform.scale;
+    const originWorldY = (0 - origTransform.y) / origTransform.scale;
+    const originWorldW = rect.width / origTransform.scale;
+    const originWorldH = rect.height / origTransform.scale;
+    setOverviewViewportBox({
+      x: originWorldX,
+      y: originWorldY,
+      width: originWorldW,
+      height: originWorldH
+    });
     
     // Calculate world bounding box
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -2500,17 +2598,20 @@ export default function App() {
     const workspace = document.getElementById('canvas-workspace');
     if (workspace && workspace.getAttribute('data-zooming') !== 'true') {
       workspace.setAttribute('data-zooming', 'true');
+      workspace.setAttribute('data-gesture', 'true');
       isZoomingRef.current = true;
       setIsZooming(true);
     }
     clearTimeout(zoomTimeoutRef.current);
-    zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 2000);
+    zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 400);
     
     const animConfig: any = { type: 'tween', duration: 0.4, ease: [0.16, 1, 0.3, 1] };
     animate(tScale, targetScale, animConfig);
     animate(tx, targetTx, animConfig);
     animate(ty, targetTy, animConfig);
 
+    setIsDomCardsActive(false);
+    setIsNanoCanvasActive(true);
     setIsOverviewMode(true);
     isOverviewModeRef.current = true;
   }, [tScale, tx, ty, restoreCanvasStyles, resetOverviewPrompt]);
@@ -2519,6 +2620,15 @@ export default function App() {
     resetOverviewPrompt();
     if (preOverviewTransform.current) {
       triggerTweenZoom(400);
+      
+      const workspace = document.getElementById('canvas-workspace');
+      if (workspace && workspace.getAttribute('data-zooming') !== 'true') {
+        workspace.setAttribute('data-zooming', 'true');
+        workspace.setAttribute('data-gesture', 'true');
+        isZoomingRef.current = true;
+        setIsZooming(true);
+      }
+
       const { x, y, scale } = preOverviewTransform.current;
       targetTransform.current = { x, y, scale };
       
@@ -2548,12 +2658,11 @@ export default function App() {
     const prevScale = tScale.get();
     if (Math.abs(prevScale - newScale) < 0.001) return;
     
-    triggerTweenZoom(220);
-    
     // 1. Degrade styles during active animation to keep frames buttery smooth (Intent-Driven Lazy Restoration)
     const workspace = document.getElementById('canvas-workspace');
     if (workspace && workspace.getAttribute('data-zooming') !== 'true') {
       workspace.setAttribute('data-zooming', 'true');
+      workspace.setAttribute('data-gesture', 'true');
       isZoomingRef.current = true;
       setIsZooming(true);
     }
@@ -2561,9 +2670,8 @@ export default function App() {
     // 2. Clear previous restoration timers
     clearTimeout(zoomTimeoutRef.current);
     
-    // 3. Set restoration timer based on target scale
-    const idleDelay = newScale >= 0.60 ? 150 : 2000;
-    zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, idleDelay);
+    // 3. Set restoration timer after tween animation finishes
+    zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 400);
 
     // 4. Calculate coordinate transition zooming toward center of screen
     const centerX = window.innerWidth / 2;
@@ -2654,6 +2762,7 @@ export default function App() {
     const workspace = document.getElementById('canvas-workspace');
     if (workspace && workspace.getAttribute('data-zooming') !== 'true') {
       workspace.setAttribute('data-zooming', 'true');
+      workspace.setAttribute('data-gesture', 'true');
       isZoomingRef.current = true;
       setIsZooming(true);
     }
@@ -2669,10 +2778,8 @@ export default function App() {
 
       targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
 
-      triggerTweenZoom(360);
-
       clearTimeout(zoomTimeoutRef.current);
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 150);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 360);
 
       animate(tScale, targetScale, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
       animate(tx, targetTx, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
@@ -2684,10 +2791,8 @@ export default function App() {
 
       targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
 
-      triggerTweenZoom(400);
-
       clearTimeout(zoomTimeoutRef.current);
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 2000);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 400);
 
       animate(tScale, targetScale, { type: 'tween', duration: 0.40, ease: [0.16, 1, 0.3, 1] });
       animate(tx, targetTx, { type: 'tween', duration: 0.40, ease: [0.16, 1, 0.3, 1] });
@@ -2700,16 +2805,27 @@ export default function App() {
 
       targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
 
-      triggerTweenZoom(360);
-
       clearTimeout(zoomTimeoutRef.current);
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 150);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 360);
 
-      animate(tScale, targetScale, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
+      // Set state to defer mounting until zoom animation completes
+      isZoomAnimationActiveRef.current = true;
+      setIsZoomAnimationActive(true);
+
+      animate(tScale, targetScale, { 
+        type: 'tween', 
+        duration: 0.36, 
+        ease: [0.16, 1, 0.3, 1],
+        onComplete: () => {
+          isZoomAnimationActiveRef.current = false;
+          setIsZoomAnimationActive(false);
+          setMountEpoch(n => (n + 1) % 1000000);
+        }
+      });
       animate(tx, targetTx, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
       animate(ty, targetTy, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
     }
-  }, [tScale, tx, ty, restoreCanvasStyles, triggerTweenZoom]);
+  }, [tScale, tx, ty, restoreCanvasStyles]);
 
     useEffect(() => {
     const container = containerRef.current;
@@ -2816,6 +2932,7 @@ export default function App() {
       const workspace = document.getElementById('canvas-workspace');
       if (workspace && workspace.getAttribute('data-zooming') !== 'true') {
         workspace.setAttribute('data-zooming', 'true');
+        workspace.setAttribute('data-gesture', 'true');
         isZoomingRef.current = true;
         setIsZooming(true);
       }
@@ -2829,11 +2946,8 @@ export default function App() {
       
       const newScale = Math.min(Math.max(0.1, prevTarget.scale * Math.exp(delta)), 5);
       
-      // 3. LOD Rasterization Strategy:
-      // If zoomed in (scale >= 0.60), restore quickly (150ms) for crisp text.
-      // If zoomed out (scale < 0.60), restore slowly (2000ms) to prevent massive reflow stutters.
-      const idleDelay = newScale >= 0.60 ? 150 : 2000;
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, idleDelay);
+      // 3. Intent-Driven Lazy Restoration: 300ms idle fallback
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 300);
       
       const rect = container.getBoundingClientRect();
       const cursorX = e.clientX - rect.left;
@@ -2912,6 +3026,9 @@ export default function App() {
     }
 
     if (e.button === 0) {
+      // Level 1 Intent Trigger: User left-clicks on canvas or card, instantly restore high-fidelity styles
+      restoreCanvasStyles();
+
       const cursorX = e.clientX - rect.left;
       const cursorY = e.clientY - rect.top;
         const canvasX = (cursorX - tx.get()) / tScale.get();
@@ -2975,13 +3092,13 @@ export default function App() {
     // Bypass React state to eliminate the 16ms start-of-drag stutter
     isDraggingCanvasRef.current = true;
     
-    // Instead of forcing a React re-render immediately with setIsDragging(true) which blocks the main thread,
-    // we use document.body.style.cursor to update the cursor instantly without React.
     document.body.style.cursor = 'grabbing';
     
-    // Note: We deliberately DO NOT set data-zooming=true here anymore.
-    // Pure translation (dragging) is hardware accelerated and composited easily by the GPU even with heavy box-shadows.
-    // Toggling the shadows OFF here was actually causing a style recalculation stutter!
+    const workspace = document.getElementById('canvas-workspace');
+    if (workspace) {
+      workspace.setAttribute('data-panning', 'true');
+      workspace.setAttribute('data-gesture', 'true');
+    }
     
     lastPointer.current = { x: e.clientX, y: e.clientY };
     containerRef.current?.setPointerCapture(e.pointerId);
@@ -3011,16 +3128,16 @@ export default function App() {
       if (nanoDragRef.current.didMove) {
         const draggingId = nanoDragRef.current.cardId;
         const isDraggingSelected = selectedCardIdsRef.current.includes(draggingId);
-        const initMap = new Map<string, { id: string; x: number; y: number }>(
-          nanoDragRef.current.initialCards.map(c => [c.id, c])
-        );
-        setCards(prev => prev.map(c => {
-          if (isDraggingSelected ? selectedCardIdsRef.current.includes(c.id) : c.id === draggingId) {
-            const init = initMap.get(c.id);
-            if (init) return { ...c, x: init.x + dx, y: init.y + dy };
-          }
-          return c;
-        }), false);
+        
+        // Zero-React-Latency: Save real-time dragging state in window and trigger custom event
+        (window as any).__nanoDragging = {
+          cardId: draggingId,
+          dx,
+          dy,
+          isDraggingSelected,
+          selectedCardIds: selectedCardIdsRef.current
+        };
+        window.dispatchEvent(new CustomEvent('nano-dragging'));
       }
     } else if (selectionBox) {
       const canvasX = (e.clientX - tx.get()) / tScale.get();
@@ -3055,21 +3172,46 @@ export default function App() {
     isDraggingCanvasRef.current = false;
     document.body.style.cursor = 'default';
     
+    // Per Intent-Driven Lazy Restoration:
+    // DO NOT synchronously remove data-panning/data-gesture immediately on pointer up!
+    // Removing them on every quick click-drag triggers synchronous reflow and layout recalculation storms.
+    // Instead, maintain persistent degradation and let the 300ms idle fallback timer or left-click intent restore it.
+
     if (nanoDragRef.current) {
       if (nanoDragRef.current.didMove) {
-        // Record moved cards into history on pointer release
-        setCards(prev => [...prev], true);
+        // Zero-React-Latency Drag Release: Apply final coordinates once to React State and push to History
+        const draggingId = nanoDragRef.current.cardId;
+        const isDraggingSelected = selectedCardIdsRef.current.includes(draggingId);
+        const currentScale = tScale.get();
+        const dragDx = (e.clientX - nanoDragRef.current.startX) / currentScale;
+        const dragDy = (e.clientY - nanoDragRef.current.startY) / currentScale;
+        
+        const initMap = new Map<string, { id: string; x: number; y: number }>(
+          nanoDragRef.current.initialCards.map(c => [c.id, c])
+        );
+        
+        (window as any).__nanoDragging = null;
+        // Trigger a final repaint event to clear offset rendering
+        window.dispatchEvent(new CustomEvent('nano-dragging'));
+
+        setCards(prev => prev.map(c => {
+          if (isDraggingSelected ? selectedCardIdsRef.current.includes(c.id) : c.id === draggingId) {
+            const init = initMap.get(c.id);
+            if (init) return { ...c, x: init.x + dragDx, y: init.y + dragDy };
+          }
+          return c;
+        }), true);
+      } else {
+        // Simple click in nano-LOD mode: deselect other cards if clicked card was already selected
+        handleCardSelect(e, nanoDragRef.current.cardId, true);
       }
       nanoDragRef.current = null;
     }
 
-    // Instead of forcing a restore immediately after a middle-click drag,
-    // we assume the user might drag or zoom again very soon.
-    // So we reset the "idle" timer using our LOD Rasterization strategy.
+    // Reset idle timer after drag
     if (e.button === 1) {
       clearTimeout(zoomTimeoutRef.current);
-      const idleDelay = tScale.get() >= 0.60 ? 150 : 2000;
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, idleDelay);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 300);
     }
     
     setSelectionBox(null);
@@ -3129,13 +3271,10 @@ export default function App() {
   // 4. Different LOD levels have adaptive quotas (Macro: 1/f, Standard: 3/f, Micro: 8/f, Nano: 0).
   // 5. If the user touches the wheel or drags midway, mounting pauses immediately without stutter.
   useEffect(() => {
-    if (!isDomCardsActive) {
-      setRenderedCardIds(prev => prev.size === 0 ? prev : new Set());
-      return;
-    }
-
-    // Freeze DOM card mounting during double-click or overview transition tween until landing
-    if (isTweenZooming) {
+    if (!isDomCardsActive || isZoomAnimationActive) {
+      if (!isDomCardsActive) {
+        setRenderedCardIds(prev => prev.size === 0 ? prev : new Set());
+      }
       return;
     }
 
@@ -3163,10 +3302,6 @@ export default function App() {
     let rafId: number;
 
     const mountStep = () => {
-      if (isTweenZoomingRef.current) {
-        return;
-      }
-
       const scaleVal = tScale.get() || 1;
       const quota = getLodMountQuota(scaleVal, false);
       if (quota <= 0) return;
@@ -3211,12 +3346,12 @@ export default function App() {
     return () => {
       cancelAnimationFrame(rafId);
     };
-  }, [isDomCardsActive, isTweenZooming, mountEpoch, visibleCards, renderedCardIds, tx, ty, tScale]);
+  }, [isDomCardsActive, isZoomAnimationActive, mountEpoch, visibleCards, renderedCardIds, tx, ty, tScale]);
 
   return (
     <div 
       ref={containerRef}
-      className="w-screen h-screen overflow-hidden bg-[#e7e7e7] dark:bg-[#1c1c1e] relative select-none touch-none"
+      className={`w-screen h-screen overflow-hidden bg-[#e7e7e7] dark:bg-[#1c1c1e] relative select-none touch-none ${isOverviewMode ? 'overview-cursor' : ''}`}
       onPointerDownCapture={(e) => {
         // If in overview mode and user left-clicks, navigate and dive down into the clicked position!
         if (e.button === 0 && (preOverviewTransform.current || isOverviewModeRef.current)) {
@@ -3244,10 +3379,23 @@ export default function App() {
           
           triggerTweenZoom(400);
           
-          const animConfig: any = { type: 'tween', duration: 0.4, ease: [0.16, 1, 0.3, 1] };
+          // Defer progressive DOM card mounting until the zoom animation finishes
+          isZoomAnimationActiveRef.current = true;
+          setIsZoomAnimationActive(true);
+
+          const animConfig: any = { 
+            type: 'tween', 
+            duration: 0.4, 
+            ease: [0.16, 1, 0.3, 1],
+            onComplete: () => {
+              isZoomAnimationActiveRef.current = false;
+              setIsZoomAnimationActive(false);
+              setMountEpoch(n => (n + 1) % 1000000);
+            }
+          };
           animate(tScale, targetScale, animConfig);
-          animate(tx, targetTx, animConfig);
-          animate(ty, targetTy, animConfig);
+          animate(tx, targetTx, { type: 'tween', duration: 0.4, ease: [0.16, 1, 0.3, 1] });
+          animate(ty, targetTy, { type: 'tween', duration: 0.4, ease: [0.16, 1, 0.3, 1] });
           
           clearTimeout(zoomTimeoutRef.current);
           zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 400);
@@ -3332,6 +3480,7 @@ export default function App() {
 
       {/* Top Right Controls */}
       <div className="fixed top-4 right-4 z-50 flex items-center gap-2">
+        <McpKeyButton />
         <button
           onClick={() => setShowSettings(true)}
           onPointerDown={e => e.stopPropagation()}
@@ -3379,15 +3528,17 @@ export default function App() {
         }}
       />
 
-      {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.60 or during staggered DOM loading) */}
+      {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.40 or during staggered DOM loading) */}
       <NanoLodCanvas
         cards={cards}
         selectedCardIds={selectedCardIds}
+        renderedCardIds={renderedCardIds}
         pickerSession={pickerSession}
         scale={tScale}
         tx={tx}
         ty={ty}
         isDarkMode={isDarkMode}
+        isOverviewMode={isOverviewMode}
         isActive={isNanoCanvasActive || (renderedCardIds.size < visibleCards.length && visibleCards.length > 0)}
         onReady={handleNanoCanvasReady}
         onThumbnailGenerated={(id, thumbnailUrl) => {
@@ -3398,19 +3549,24 @@ export default function App() {
       {/* Canvas Workspace for Nodes/Cards */}
       <motion.div 
         id="canvas-workspace"
-        className={`absolute top-0 left-0 transform-gpu group/canvas z-0 ${isZooming || isDraggingCanvasRef.current ? 'will-change-transform' : ''}`}
+        className={`absolute top-0 left-0 transform-gpu group/canvas z-0 ${isZooming || isDraggingCanvasRef.current || isTweenZooming ? 'will-change-transform' : ''}`}
         data-zooming={isZooming}
         data-scale-micro={isMicroLod}
         data-scale-nano={isNanoLod}
         style={{ transformOrigin: '0 0', x: tx, y: ty, scale: tScale }}
       >
 
-        {/* Canvas Items: In Nano-LOD mode (scale < 0.60), unmount all DOM cards for ultra-fast Hybrid Canvas rendering */}
-        {isDomCardsActive && visibleCards.map(card => {
+        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.40), unmount all DOM cards for ultra-fast Hybrid Canvas rendering */}
+        {!isOverviewMode && isDomCardsActive && visibleCards.map(card => {
           if (!renderedCardIds.has(card.id)) return null;
           const hasImage = Boolean(card.imageUrl || card.originalImageUrl || card.thumbnailUrl);
           const isPickerSelectable = Boolean(pickerSession && card.id !== pickerSession.targetCardId && hasImage);
-          const pickerIndex = pickerSession ? pickerSession.selectedCardIds.indexOf(card.id) : -1;
+          const pickerIndex = pickerSession 
+            ? pickerSession.selectedReferences.findIndex(ref => 
+                ref.sourceCardId === card.id || 
+                (ref.url && (ref.url === card.imageUrl || ref.url === card.originalImageUrl || ref.url === card.thumbnailUrl))
+              )
+            : -1;
           const pickerSelectionIndex = pickerIndex !== -1 ? pickerIndex + 1 : undefined;
 
           return (
@@ -3451,6 +3607,29 @@ export default function App() {
             }}
           />
         )}
+
+        {/* Overview Mode Viewport Indicator Box */}
+        <AnimatePresence>
+          {overviewViewportBox && (
+            <motion.div
+              key="overview-viewport-indicator"
+              initial={{ opacity: 0.9 }}
+              animate={{ opacity: isOverviewMode ? 1 : 0 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.38, ease: [0.16, 1, 0.3, 1] }}
+              className="absolute pointer-events-none z-[80] border border-solid border-blue-500/90 dark:border-blue-400/95 bg-blue-500/[0.04] dark:bg-blue-400/[0.06]"
+              style={{
+                left: overviewViewportBox.x,
+                top: overviewViewportBox.y,
+                width: overviewViewportBox.width,
+                height: overviewViewportBox.height,
+                borderWidth: 'calc(2px / var(--current-scale, 1))',
+                borderRadius: 0,
+                boxShadow: '0 0 0 calc(1px / var(--current-scale, 1)) rgba(59, 130, 246, 0.25)',
+              }}
+            />
+          )}
+        </AnimatePresence>
         
         {/* Agent Context Menus (Canvas Space) */}
         {Object.entries(contextMenus)
@@ -3753,6 +3932,24 @@ export default function App() {
         </button>
       </div>
 
+      {/* Toast: Overview Mode Navigation Hint */}
+      <AnimatePresence>
+        {isOverviewMode && (
+          <motion.div
+            initial={{ opacity: 0, y: -20, scale: 0.94 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -16, scale: 0.94 }}
+            transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
+            className="fixed top-5 left-1/2 -translate-x-1/2 z-[100] pointer-events-none select-none"
+          >
+            <div className="flex items-center gap-2 px-4 py-2 rounded-full bg-white/95 dark:bg-[#252528]/95 backdrop-blur-md border border-neutral-200/90 dark:border-neutral-700/80 shadow-[0_8px_30px_rgb(0,0,0,0.12)] dark:shadow-[0_8px_30px_rgb(0,0,0,0.35)] text-xs md:text-sm font-medium text-neutral-800 dark:text-neutral-100">
+              <MousePointerClick className="w-4 h-4 text-blue-500 dark:text-blue-400 shrink-0" />
+              <span className="tracking-wide">鼠标点击任意位置跳转</span>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Toast: Prompt to enter Overview Mode */}
       <AnimatePresence>
         {showOverviewPromptToast && !isOverviewMode && (
@@ -3809,20 +4006,20 @@ export default function App() {
                   <span className="text-[10px] opacity-60 bg-neutral-800 px-1 py-0.5 rounded">Esc</span>
                 </button>
 
-                <button
+                 <button
                   type="button"
                   onClick={handleConfirmPickerSession}
-                  disabled={pickerSession.selectedCardIds.length === 0}
+                  disabled={pickerSession.selectedReferences.length === 0}
                   className={`px-3.5 py-1.5 rounded-xl font-semibold text-xs flex items-center gap-1.5 transition-all shadow-sm ${
-                    pickerSession.selectedCardIds.length > 0
+                    pickerSession.selectedReferences.length > 0
                       ? 'bg-blue-600 hover:bg-blue-500 text-white cursor-pointer active:scale-95 shadow-[0_0_16px_rgba(37,99,235,0.4)]'
                       : 'bg-neutral-800 text-neutral-500 cursor-not-allowed'
                   }`}
                 >
                   <span>确认导入</span>
-                  {pickerSession.selectedCardIds.length > 0 && (
+                  {pickerSession.selectedReferences.length > 0 && (
                     <span className="px-1.5 py-0.2 rounded-full bg-white/25 text-white text-[10px]">
-                      {pickerSession.selectedCardIds.length}
+                      {pickerSession.selectedReferences.length}
                     </span>
                   )}
                 </button>
@@ -3830,7 +4027,7 @@ export default function App() {
             </div>
 
             {/* 2. Independent Reference Image Preview Tray (Positioned below Toast, Aspect-Ratio Display) */}
-            {pickerSession.selectedCardIds.length > 0 && (
+            {pickerSession.selectedReferences.length > 0 && (
               <motion.div 
                 initial={{ opacity: 0, y: -8, scale: 0.95 }}
                 animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -3839,17 +4036,14 @@ export default function App() {
                 className="p-2 px-3 rounded-2xl bg-neutral-950/90 backdrop-blur-md border border-neutral-800 shadow-[0_16px_36px_rgba(0,0,0,0.4)] w-fit max-w-[98vw] max-h-[34vh] overflow-y-auto scrollbar-thin"
               >
                 <div className="flex flex-wrap items-start justify-center gap-x-4 gap-y-2">
-                  {pickerSession.selectedCardIds.map((cid, idx) => {
-                    const c = cards.find(item => item.id === cid);
-                    const img = c?.imageUrl || c?.originalImageUrl || c?.thumbnailUrl;
-                    const cardName = c?.fileName 
-                      ? c.fileName.replace(/\.[^/.]+$/, "") 
-                      : (c?.title?.trim() || c?.roleName?.trim() || (c?.prompt?.trim() ? (c.prompt.length > 14 ? c.prompt.slice(0, 14) + '…' : c.prompt) : `资产 #${idx + 1}`));
+                  {pickerSession.selectedReferences.map((ref, idx) => {
+                    const img = ref.url || ref.thumbnailUrl;
+                    const cardName = ref.name || `参考图 #${idx + 1}`;
                     return (
                       <div 
-                        key={cid} 
+                        key={idx} 
                         className="flex flex-col items-center gap-1 group flex-shrink-0 cursor-pointer"
-                        onClick={() => handleTogglePickerCard(cid)}
+                        onClick={() => handleRemovePickerReference(idx)}
                         title={`${cardName} (点击移除)`}
                       >
                         <div className="relative h-16 rounded-xl overflow-hidden border-2 border-blue-500 shadow-md bg-neutral-900 transition-all group-hover:scale-[1.03] group-hover:border-red-500">
@@ -3857,6 +4051,8 @@ export default function App() {
                             <img 
                               src={img} 
                               alt={cardName} 
+                              loading="lazy"
+                              decoding="async"
                               className="h-full w-auto max-w-[110px] object-contain block" 
                             />
                           ) : (

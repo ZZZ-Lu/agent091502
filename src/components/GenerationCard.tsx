@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence, MotionValue } from 'motion/react';
 import { 
@@ -21,6 +21,8 @@ import {
 import { isCardIntersectingRectangle } from '../utils/viewportCulling';
 import { CardImageCanvas } from './CardImageCanvas';
 import { ScriptProject } from '../types/script';
+import { generateImageThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from '../utils/thumbnail';
+import { getActiveMcpKey } from '../utils/mcpStorage';
 
 export type CardState = 'draft' | 'generating' | 'completed';
 export type AspectRatio = '1:1' | '3:4' | '9:16' | '16:9';
@@ -76,6 +78,9 @@ export interface CardData {
   trueOriginalImageUrl?: string | null;
   currentTime?: number;
   thumbnailUrl?: string;
+  microLodThumbnailUrl?: string; // 64px max edge
+  fullDetailThumbnailUrl?: string; // 128px max edge
+  closeupThumbnailUrl?: string; // 256px max edge
   customWidth?: number;
   customHeight?: number;
   fileName?: string;
@@ -83,13 +88,211 @@ export interface CardData {
   nativeHeight?: number;
   referenceImages?: Array<{
     url: string;
+    thumbnailUrl?: string;
+    microLodThumbnailUrl?: string; // 64px max edge
+    fullDetailThumbnailUrl?: string; // 128px max edge
+    closeupThumbnailUrl?: string; // 256px max edge
     name?: string;
     fileData?: Blob;
+    sourceCardId?: string;
   }>;
   referenceImageUrl?: string | null;
   referenceImageName?: string;
   referenceImageFileData?: Blob;
 }
+
+const refDimensionsCache = new Map<string, { width: number; height: number }>();
+
+const ReferenceThumbItem = React.memo(function ReferenceThumbItem({
+  item,
+  idx,
+  currentScale,
+  removeReferenceImage,
+  setOpenMenu,
+  setHoveredRefUrl,
+  onMentionItem,
+}: {
+  item: {
+    url: string;
+    thumbnailUrl?: string;
+    microLodThumbnailUrl?: string;
+    fullDetailThumbnailUrl?: string;
+    closeupThumbnailUrl?: string;
+    name?: string;
+    fileData?: Blob;
+    sourceCardId?: string;
+  };
+  idx: number;
+  currentScale: number;
+  removeReferenceImage: (index: number) => void;
+  setOpenMenu: React.Dispatch<React.SetStateAction<{ type: 'ratio' | 'res' | 'ref'; ownerId: string } | null>>;
+  setHoveredRefUrl: (url: string | null) => void;
+  onMentionItem?: (item: { name: string; url?: string; fileData?: Blob }) => void;
+}) {
+  // Select the appropriate URL based on the scale:
+  // - microlod (scale < 1.0): 64px (microLodThumbnailUrl)
+  // - fulldetail (1.0 <= scale < 2.0): 128px (fullDetailThumbnailUrl)
+  // - closeup (scale >= 2.0): 256px (closeupThumbnailUrl)
+  let displaySrc = item.url;
+  if (currentScale < 1.0) {
+    displaySrc = item.microLodThumbnailUrl || item.thumbnailUrl || item.url;
+  } else if (currentScale < 2.0) {
+    displaySrc = item.fullDetailThumbnailUrl || item.thumbnailUrl || item.url;
+  } else {
+    displaySrc = item.closeupThumbnailUrl || item.thumbnailUrl || item.url;
+  }
+
+  // The hover preview displays the same 2K proxy image version that is rendered on the asset card under microLOD (item.url)
+  const hoverUrl = item.url || item.thumbnailUrl || '';
+
+  // Preload dimensions into cache on hover so preview height is known immediately
+  const handleThumbMouseEnter = () => {
+    if (hoverUrl && !refDimensionsCache.has(hoverUrl)) {
+      const img = new Image();
+      img.src = hoverUrl;
+      img.onload = () => {
+        if (img.naturalWidth && img.naturalHeight) {
+          refDimensionsCache.set(hoverUrl, {
+            width: img.naturalWidth,
+            height: img.naturalHeight,
+          });
+        }
+      };
+    }
+    setHoveredRefUrl(hoverUrl);
+  };
+
+  return (
+    <div
+      className="group/thumb relative w-12 h-12 cursor-pointer"
+      title={item.name || `参考图 ${idx + 1}`}
+      onClick={(e) => {
+        e.stopPropagation();
+        const isAgent = !e.nativeEvent.isTrusted;
+        setOpenMenu((prev) =>
+          prev?.type === 'ref' ? null : { type: 'ref', ownerId: isAgent ? 'agent' : 'user' }
+        );
+      }}
+      onMouseEnter={handleThumbMouseEnter}
+      onMouseLeave={() => setHoveredRefUrl(null)}
+    >
+      <div className="w-full h-full bg-gray-50 dark:bg-neutral-800/60 rounded-lg border border-gray-200 dark:border-neutral-700/60 flex items-center justify-center overflow-hidden hover:border-gray-300 dark:hover:border-neutral-500 transition-colors duration-150 shadow-xs relative translate-z-0 transform-gpu">
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (onMentionItem) {
+              onMentionItem({ name: item.name || `参考图 ${idx + 1}`, url: item.url, fileData: item.fileData });
+            }
+          }}
+          className="absolute top-0.5 left-0.5 right-0.5 z-10 pointer-events-auto hover:bg-blue-500/20 dark:hover:bg-blue-400/20 rounded px-0.5 transition-colors cursor-pointer text-left block"
+          title="点击在提示词中@此参考图"
+        >
+          <span className="text-[6.5px] font-bold text-[#3b82f6] dark:text-blue-400 select-none block truncate leading-none text-left tracking-tight hover:underline">
+            @{item.name || `图 ${idx + 1}`}
+          </span>
+        </button>
+
+        <img
+          src={displaySrc}
+          alt={item.name || `参考图 ${idx + 1}`}
+          loading="lazy"
+          decoding="async"
+          className="max-w-full max-h-full object-contain pointer-events-none"
+          referrerPolicy="no-referrer"
+        />
+      </div>
+
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          setHoveredRefUrl(null);
+          removeReferenceImage(idx);
+        }}
+        className="absolute -top-1 -right-1 w-3.5 h-3.5 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center opacity-0 group-hover/thumb:opacity-100 transition-opacity duration-150 shadow-md z-20 p-0"
+        title="移除参考图"
+      >
+        <X className="w-2 h-2 stroke-[3]" />
+      </button>
+    </div>
+  );
+});
+
+// Cache specifically for 128px mention menu thumbnails
+const mentionThumb128Cache = new Map<string, string>();
+
+const MentionCandidateAvatar = React.memo(function MentionCandidateAvatar({
+  item,
+}: {
+  item: {
+    id: string;
+    name: string;
+    url?: string;
+    thumbnailUrl?: string;
+    fullDetailThumbnailUrl?: string;
+    fileData?: Blob;
+  };
+}) {
+  const [thumbSrc, setThumbSrc] = useState<string | undefined>(() => {
+    if (item.fullDetailThumbnailUrl) return item.fullDetailThumbnailUrl;
+    if (item.url && mentionThumb128Cache.has(item.url)) return mentionThumb128Cache.get(item.url);
+    if (item.thumbnailUrl && mentionThumb128Cache.has(item.thumbnailUrl)) return mentionThumb128Cache.get(item.thumbnailUrl);
+    return item.thumbnailUrl || undefined;
+  });
+
+  useEffect(() => {
+    if (item.fullDetailThumbnailUrl) {
+      setThumbSrc(item.fullDetailThumbnailUrl);
+      if (item.url) mentionThumb128Cache.set(item.url, item.fullDetailThumbnailUrl);
+      return;
+    }
+
+    const sourceKey = item.url || item.thumbnailUrl || '';
+    if (sourceKey && mentionThumb128Cache.has(sourceKey)) {
+      setThumbSrc(mentionThumb128Cache.get(sourceKey));
+      return;
+    }
+
+    const source = item.fileData || item.url || item.thumbnailUrl;
+    if (!source) return;
+
+    let isMounted = true;
+    generateImageThumbnail(source, 128, 0.90)
+      .then((thumb) => {
+        if (thumb && sourceKey) {
+          mentionThumb128Cache.set(sourceKey, thumb);
+        }
+        if (isMounted && thumb) {
+          setThumbSrc(thumb);
+        }
+      })
+      .catch(() => {
+        if (isMounted && item.url) {
+          setThumbSrc(item.url);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [item.url, item.thumbnailUrl, item.fullDetailThumbnailUrl, item.fileData]);
+
+  if (!thumbSrc && !item.url) {
+    return <span className="text-[11px] font-bold text-gray-400">@</span>;
+  }
+
+  return (
+    <img
+      src={thumbSrc || item.url}
+      alt={item.name}
+      loading="lazy"
+      decoding="async"
+      className="w-full h-full object-cover"
+      referrerPolicy="no-referrer"
+    />
+  );
+});
 
 export interface GenerationCardProps {
   key?: React.Key;
@@ -105,7 +308,7 @@ export interface GenerationCardProps {
   isPickerSelectable?: boolean;
   pickerSelectionIndex?: number;
   onStartCanvasPicker?: (cardId: string) => void;
-  onSelect?: (e: React.PointerEvent, id: string) => void;
+  onSelect?: (e: React.PointerEvent, id: string, selectOnlyOnPointerUp?: boolean) => void;
   onDrag?: (id: string, dx: number, dy: number) => void;
   onDragEnd?: (id: string, totalDx: number, totalDy: number) => void;
   onDelete?: (id: string) => void;
@@ -133,37 +336,210 @@ export const GenerationCard = React.memo(function GenerationCard({
 }: GenerationCardProps) {
   const { id, x, y, state, ratio, res, prompt, imageUrl, isVideo, currentTime } = data;
   
+  const [currentScale, setCurrentScale] = useState(() => scale.get());
+  useEffect(() => {
+    return scale.on('change', (v) => {
+      setCurrentScale(v);
+    });
+  }, [scale]);
+
   const [openMenu, setOpenMenu] = useState<{ type: 'ratio' | 'res' | 'ref', ownerId: string } | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
   const [progress, setProgress] = useState(0);
   const [duration, setDuration] = useState(0);
 
+  // Local buffered prompt state for 0-latency typing (decouples typing from full canvas re-render)
+  const [localPrompt, setLocalPrompt] = useState(prompt || '');
+  const localPromptRef = useRef(localPrompt);
+  localPromptRef.current = localPrompt;
+  const isTypingRef = useRef(false);
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Synchronize from external data.prompt when not actively typing or when external prompt changed significantly
+  useEffect(() => {
+    if (!isTypingRef.current && (prompt || '') !== localPromptRef.current) {
+      setLocalPrompt(prompt || '');
+    }
+  }, [prompt]);
+
+  // Flush pending prompt sync on unmount
+  useEffect(() => {
+    return () => {
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+        onUpdate(id, { prompt: localPromptRef.current }, false);
+      }
+    };
+  }, [id, onUpdate]);
+
+  const commitPrompt = (newVal: string, isSignificant = false) => {
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
+    }
+    setLocalPrompt(newVal);
+    onUpdate(id, { prompt: newVal }, isSignificant);
+  };
+
   // Reference Image States
   const [showAssetPicker, setShowAssetPicker] = useState(false);
   const [assetFilter, setAssetFilter] = useState<'all' | 'characters' | 'locations' | 'props'>('all');
   const [assetSearch, setAssetSearch] = useState('');
+  const [hoveredRefUrl, setHoveredRefUrl] = useState<string | null>(null);
+  const [activePreviewUrl, setActivePreviewUrl] = useState<string | null>(null);
+  const [isRebounding, setIsRebounding] = useState(false);
+  const reboundTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // @ Mention State
+  const [mentionMenuOpen, setMentionMenuOpen] = useState(false);
+  const [mentionQuery, setMentionQuery] = useState('');
+  const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
+  const mirrorRef = useRef<HTMLDivElement>(null);
+  const mentionMenuRef = useRef<HTMLDivElement>(null);
+  const [previewDimensions, setPreviewDimensions] = useState<{ width: number; height: number } | null>(() => {
+    return hoveredRefUrl ? refDimensionsCache.get(hoveredRefUrl) || null : null;
+  });
+
+  useEffect(() => {
+    if (hoveredRefUrl) {
+      if (reboundTimerRef.current) {
+        clearTimeout(reboundTimerRef.current);
+        reboundTimerRef.current = null;
+      }
+      setIsRebounding(false);
+      setActivePreviewUrl(hoveredRefUrl);
+    }
+  }, [hoveredRefUrl]);
+
+  useEffect(() => {
+    return () => {
+      if (reboundTimerRef.current) {
+        clearTimeout(reboundTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!hoveredRefUrl) {
+      setPreviewDimensions(null);
+      return;
+    }
+
+    const cached = refDimensionsCache.get(hoveredRefUrl);
+    if (cached) {
+      setPreviewDimensions(cached);
+      return;
+    }
+
+    let isMounted = true;
+    const img = new Image();
+    img.src = hoveredRefUrl;
+
+    const onDims = () => {
+      if (!isMounted) return;
+      const dims = {
+        width: img.naturalWidth || 16,
+        height: img.naturalHeight || 9,
+      };
+      refDimensionsCache.set(hoveredRefUrl, dims);
+      setPreviewDimensions(dims);
+    };
+
+    if (img.complete && img.naturalWidth > 0) {
+      onDims();
+    } else {
+      img.onload = onDims;
+    }
+
+    return () => {
+      isMounted = false;
+    };
+  }, [hoveredRefUrl]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const refMenuContainerRef = useRef<HTMLDivElement>(null);
   
   const cardRef = useRef<HTMLDivElement>(null);
+  const promptContainerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const videoContainerRef = useRef<HTMLDivElement>(null);
   const lastSavedTimeRef = useRef<number>(currentTime || 0);
   const menuContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  // Intent-driven lazy restoration for Video Mounting:
+  // When canvas zoom/pan/gesture ends and styles/tags restore, if mouse is inside the video card,
+  // restore video mounting immediately alongside the card top text tags (.asset-heavy-dom).
+  useEffect(() => {
+    if (!isVideo) return;
+
+    const checkAndRestoreHover = () => {
+      const el = videoContainerRef.current;
+      if (!el) return;
+      const mouse = (window as any).__lastMousePos;
+      if (!mouse || mouse.x < 0) return;
+
+      const rect = el.getBoundingClientRect();
+      const isInside = (
+        mouse.x >= rect.left &&
+        mouse.x <= rect.right &&
+        mouse.y >= rect.top &&
+        mouse.y <= rect.bottom
+      );
+
+      if (isInside) {
+        setIsHovered(true);
+      } else if (!isPlaying) {
+        setIsHovered(false);
+      }
+    };
+
+    window.addEventListener('canvas-styles-restored', checkAndRestoreHover);
+    return () => {
+      window.removeEventListener('canvas-styles-restored', checkAndRestoreHover);
+    };
+  }, [isVideo, isPlaying]);
+
+  useEffect(() => {
+    if (!isVideo || isZooming) return;
+    const el = videoContainerRef.current;
+    if (!el) return;
+    const mouse = (window as any).__lastMousePos;
+    if (!mouse || mouse.x < 0) return;
+
+    const rect = el.getBoundingClientRect();
+    const isInside = (
+      mouse.x >= rect.left &&
+      mouse.x <= rect.right &&
+      mouse.y >= rect.top &&
+      mouse.y <= rect.bottom
+    );
+
+    if (isInside) {
+      setIsHovered(true);
+    } else if (!isPlaying) {
+      setIsHovered(false);
+    }
+  }, [isVideo, isZooming, isPlaying]);
+
   const stateRef = useRef({ id, onUpdate });
   stateRef.current = { id, onUpdate };
+
+  const captureAndSaveVideoState = (video: HTMLVideoElement) => {
+    const currTime = video.currentTime;
+    lastSavedTimeRef.current = currTime;
+    const updates: Partial<CardData> = { currentTime: currTime };
+    const thumbUrl = generateThumbnail(video);
+    if (thumbUrl) {
+      updates.thumbnailUrl = thumbUrl;
+    }
+    stateRef.current.onUpdate(stateRef.current.id, updates, false);
+  };
 
   useEffect(() => {
     return () => {
       if (videoRef.current) {
-        const video = videoRef.current;
-        const currTime = video.currentTime;
-        const thumbUrl = generateThumbnail(video);
-        const updates: Partial<CardData> = { currentTime: currTime };
-        if (thumbUrl) updates.thumbnailUrl = thumbUrl;
-        stateRef.current.onUpdate(stateRef.current.id, updates, false);
+        captureAndSaveVideoState(videoRef.current);
       }
     };
   }, []);
@@ -177,6 +553,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       // Pause actual DOM playback during zoom/pan to free GPU without changing the user's state
       if (!video.paused) {
         video.pause();
+        captureAndSaveVideoState(video);
       }
     } else {
       // Restore playback when movement stops, if it was meant to be playing
@@ -210,16 +587,16 @@ export const GenerationCard = React.memo(function GenerationCard({
   showOriginalRef.current = showOriginal;
 
   useEffect(() => {
+    if (!data.originalImageUrl) return;
     let timeout: ReturnType<typeof setTimeout>;
 
-    const onMotion = () => {
-      // Intent-driven lazy degradation:
-      // If 4K original is currently visible, drop back to proxy immediately to save rasterization
+    const onZoom = () => {
+      // Intent-driven lazy degradation on ZOOM (scaling):
+      // Drop back to proxy immediately to save heavy rasterization
       if (showOriginalRef.current) {
         setShowOriginal(false);
       }
 
-      // Debounced check: ONLY swap in 4K original if user is zoomed in past 2.0 and has idled for 300ms
       clearTimeout(timeout);
       timeout = setTimeout(() => {
         const s = scale.get();
@@ -238,23 +615,66 @@ export const GenerationCard = React.memo(function GenerationCard({
       }, 300);
     };
 
-    const unsubScale = scale.on('change', onMotion);
-    const unsubTx = tx.on('change', onMotion);
-    const unsubTy = ty.on('change', onMotion);
+    const onDrag = () => {
+      // During purely DRAG (panning, tx/ty change):
+      // Do NOT degrade immediately! Keep showOriginal as true to maintain sharpness.
+      // Simply debounce check viewport intersection to see if we should turn showOriginal off or on.
+      clearTimeout(timeout);
+      timeout = setTimeout(() => {
+        const s = scale.get();
+        if (s <= 2.0 || !data.originalImageUrl) {
+          setShowOriginal(false);
+          return;
+        }
 
-    window.addEventListener('resize', onMotion);
+        const vp = {
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+          scale: s,
+          tx: tx.get(),
+          ty: ty.get()
+        };
+        if (isCardIntersectingRectangle(data, vp)) {
+          setShowOriginal(true);
+        } else {
+          setShowOriginal(false);
+        }
+      }, 300);
+    };
+
+    const unsubScale = scale.on('change', onZoom);
+    const unsubTx = tx.on('change', onDrag);
+    const unsubTy = ty.on('change', onDrag);
+
+    window.addEventListener('resize', onZoom);
 
     return () => {
       unsubScale();
       unsubTx();
       unsubTy();
       clearTimeout(timeout);
-      window.removeEventListener('resize', onMotion);
+      window.removeEventListener('resize', onZoom);
     };
   }, [scale, tx, ty, data]);
 
   const dpr = showOriginal ? Math.min(scale.get(), 8.0) : 1;
   const { width: w, height: h } = getCardSize(data);
+
+  const isAssetCard = Boolean(data.fileData || data.originalFileData || data.fileName);
+  const isScaleMicro = currentScale < 1.0;
+
+  // Intent-driven lazy mounting:
+  // Mount the heavy interactive bottom panel only when:
+  // 1. NOT an asset card
+  // 2. AND (the card is selected OR hovered OR active with menu/picker OR in detail view >= 1.0 where state !== 'completed')
+  const shouldRenderBottomPanel = !isAssetCard && (
+    isSelected ||
+    isHovered ||
+    openMenu !== null ||
+    showAssetPicker ||
+    mentionMenuOpen ||
+    (!isScaleMicro && state !== 'completed')
+  );
   
   useEffect(() => {
     if (videoRef.current && videoRef.current.readyState >= 2) {
@@ -262,19 +682,31 @@ export const GenerationCard = React.memo(function GenerationCard({
     }
   }, [imageUrl]);
   
-  useEffect(() => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto';
-      const scrollHeight = textareaRef.current.scrollHeight;
-      textareaRef.current.style.height = `${scrollHeight}px`;
-      
-      if (scrollHeight >= 300) {
-        textareaRef.current.style.overflowY = 'auto';
-      } else {
-        textareaRef.current.style.overflowY = 'hidden';
-      }
+  const adjustTextareaHeight = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    const scrollHeight = el.scrollHeight;
+    el.style.height = `${scrollHeight}px`;
+    
+    if (scrollHeight >= 300) {
+      el.style.overflowY = 'auto';
+    } else {
+      el.style.overflowY = 'hidden';
     }
-  }, [prompt]);
+
+    if (mirrorRef.current) {
+      mirrorRef.current.scrollTop = el.scrollTop;
+    }
+  }, []);
+
+  useLayoutEffect(() => {
+    if (shouldRenderBottomPanel) {
+      adjustTextareaHeight();
+      const raf = requestAnimationFrame(adjustTextareaHeight);
+      return () => cancelAnimationFrame(raf);
+    }
+  }, [shouldRenderBottomPanel, localPrompt, adjustTextareaHeight]);
 
   // Track dragging locally for 0-latency, then sync on pointer up
   const posRef = useRef({ x, y });
@@ -285,6 +717,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   const totalDy = useRef(0);
 
   useEffect(() => {
+    if (!openMenu) return;
     const closeMenu = (e: PointerEvent) => {
       const target = e.target as Node;
       const insideParamMenu = menuContainerRef.current && menuContainerRef.current.contains(target);
@@ -305,7 +738,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     return () => {
       document.removeEventListener('pointerdown', closeMenu);
     };
-  }, []);
+  }, [openMenu]);
 
   // Update transform if external x/y change and not dragging
   useEffect(() => {
@@ -410,54 +843,93 @@ export const GenerationCard = React.memo(function GenerationCard({
         slaveNodesRef.current.forEach(slave => {
           slave.el.style.transform = `translate(${slave.initialX}px, ${slave.initialY}px)`;
         });
+        // Select only this card (deselect others) since no drag occurred
+        onSelect?.(e, id, true);
       }
     }
     e.currentTarget.releasePointerCapture(e.pointerId);
   };
 
   const handleGenerate = async () => {
-    if (!prompt.trim()) return;
+    const promptToGen = localPrompt.trim();
+    if (!promptToGen) return;
     
-    // Core Architecture Principle: "Only inject 4K original binary data into generation AI contexts"
-    // At this step, we pretend to send the trueOriginalFileData to an AI pipeline.
-    const generationPayload: any = { prompt: prompt.trim() };
+    // Ensure prompt is committed
+    commitPrompt(localPrompt);
     
-    // Normalize reference images
-    const effectiveRefImages = data.referenceImages && data.referenceImages.length > 0
-      ? data.referenceImages
-      : data.referenceImageUrl
-        ? [{ url: data.referenceImageUrl, name: data.referenceImageName, fileData: data.referenceImageFileData }]
-        : [];
-
-    if (effectiveRefImages.length > 0) {
-        generationPayload.referenceImages = effectiveRefImages;
-        generationPayload.referenceImage = effectiveRefImages[0].fileData || effectiveRefImages[0].url;
-    } else if (data.referenceImageFileData) {
-        generationPayload.referenceImage = data.referenceImageFileData;
-    } else if (data.referenceImageUrl) {
-        generationPayload.referenceImageUrl = data.referenceImageUrl;
-    } else if (data.trueOriginalFileData) {
-        // High fidelity AI reference branch
-        console.log("SENDING TRUE ORIGINAL DATA TO AI", data.trueOriginalFileData.size, "bytes");
-        generationPayload.referenceImage = data.trueOriginalFileData;
-    } else if (data.originalFileData) {
-        // Fallback for smaller images
-        console.log("SENDING STANDARD DATA TO AI", data.originalFileData.size, "bytes");
-        generationPayload.referenceImage = data.originalFileData;
-    } else if (data.fileData) {
-        // Fallback
-        generationPayload.referenceImage = data.fileData;
-    }
-
     onUpdate(id, { state: 'generating' }, true);
-    
-    // Simulate API delay
-    setTimeout(() => {
-      onUpdate(id, { 
-        imageUrl: "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=800&auto=format&fit=crop",
-        state: 'completed'
-      });
-    }, 2500);
+
+    try {
+      const activeMcp = await getActiveMcpKey();
+      
+      // Normalize reference images
+      const effectiveRefImages = data.referenceImages && data.referenceImages.length > 0
+        ? data.referenceImages
+        : data.referenceImageUrl
+          ? [{ url: data.referenceImageUrl, name: data.referenceImageName, fileData: data.referenceImageFileData }]
+          : [];
+
+      if (activeMcp && activeMcp.token) {
+        // Prepare reference image data/URLs
+        const refPayloads: string[] = [];
+        for (const ref of effectiveRefImages) {
+          if (ref.fileData instanceof Blob) {
+            try {
+              const dataUrl = await new Promise<string>((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result as string);
+                reader.onerror = reject;
+                reader.readAsDataURL(ref.fileData!);
+              });
+              refPayloads.push(dataUrl);
+            } catch {
+              if (ref.url) refPayloads.push(ref.url);
+            }
+          } else if (ref.url) {
+            refPayloads.push(ref.url);
+          }
+        }
+
+        const resResult = await fetch('/api/mcp/workrally/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            token: activeMcp.token,
+            serverUrl: activeMcp.serverUrl,
+            prompt: promptToGen,
+            ratio: ratio,
+            res: res,
+            isVideo: !!data.isVideo,
+            referenceImages: refPayloads,
+          })
+        });
+
+        const result = await resResult.json();
+        if (resResult.ok && result.success && result.mediaUrl) {
+          onUpdate(id, { 
+            imageUrl: result.mediaUrl,
+            isVideo: result.isVideo ?? data.isVideo,
+            state: 'completed'
+          }, true);
+          return;
+        } else {
+          console.warn('MCP Model generation failed:', result.error);
+          onUpdate(id, { state: 'draft' }, true);
+          return;
+        }
+      }
+
+      // Fallback demo generation if no MCP token is configured yet
+      setTimeout(() => {
+        onUpdate(id, { 
+          imageUrl: "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=800&auto=format&fit=crop",
+          state: 'completed'
+        }, true);
+      }, 2000);
+    } catch (e: any) {
+      console.error('Generation call error:', e);
+      onUpdate(id, { state: 'draft' }, true);
+    }
   };
 
   const handleLocalUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -467,12 +939,39 @@ export const GenerationCard = React.memo(function GenerationCard({
     const prevRefs = data.referenceImages && data.referenceImages.length > 0
       ? [...data.referenceImages]
       : data.referenceImageUrl ? [{ url: data.referenceImageUrl, name: data.referenceImageName, fileData: data.referenceImageFileData }] : [];
-    onUpdate(id, {
-      referenceImages: [...prevRefs, { url: objectUrl, name: file.name, fileData: file }],
-      referenceImageUrl: objectUrl,
-      referenceImageFileData: file,
-      referenceImageName: prevRefs.length > 0 ? `参考图 (${prevRefs.length + 1})` : file.name
-    }, true);
+
+    Promise.all([
+      generateImageThumbnail(file, 64, 0.90),
+      generateImageThumbnail(file, 128, 0.90),
+      generateImageThumbnail(file, 256, 0.90)
+    ]).then(([micro, full, closeup]) => {
+      thumbCache.set(objectUrl, closeup);
+      onUpdate(id, {
+        referenceImages: [
+          ...prevRefs,
+          {
+            url: objectUrl,
+            thumbnailUrl: closeup,
+            microLodThumbnailUrl: micro,
+            fullDetailThumbnailUrl: full,
+            closeupThumbnailUrl: closeup,
+            name: file.name,
+            fileData: file
+          }
+        ],
+        referenceImageUrl: objectUrl,
+        referenceImageFileData: file,
+        referenceImageName: prevRefs.length > 0 ? `参考图 (${prevRefs.length + 1})` : file.name
+      }, true);
+    }).catch(() => {
+      onUpdate(id, {
+        referenceImages: [...prevRefs, { url: objectUrl, name: file.name, fileData: file }],
+        referenceImageUrl: objectUrl,
+        referenceImageFileData: file,
+        referenceImageName: prevRefs.length > 0 ? `参考图 (${prevRefs.length + 1})` : file.name
+      }, true);
+    });
+
     e.target.value = '';
     setOpenMenu(null);
   };
@@ -481,17 +980,46 @@ export const GenerationCard = React.memo(function GenerationCard({
     const prevRefs = data.referenceImages && data.referenceImages.length > 0
       ? [...data.referenceImages]
       : data.referenceImageUrl ? [{ url: data.referenceImageUrl, name: data.referenceImageName, fileData: data.referenceImageFileData }] : [];
-    const newRef = { url: asset.referenceImage || '', name: asset.name };
-    const updates: Partial<CardData> = {
-      referenceImages: newRef.url ? [...prevRefs, newRef] : prevRefs,
-      referenceImageUrl: newRef.url || data.referenceImageUrl || null,
-      referenceImageName: prevRefs.length > 0 ? `参考图 (${prevRefs.length + 1})` : asset.name,
-      referenceImageFileData: undefined
-    };
-    if (!prompt.trim() && asset.description) {
-      updates.prompt = asset.description;
+    const url = asset.referenceImage || '';
+    if (url) {
+      Promise.all([
+        generateImageThumbnail(url, 64, 0.90).catch(() => ''),
+        generateImageThumbnail(url, 128, 0.90).catch(() => ''),
+        generateImageThumbnail(url, 256, 0.90).catch(() => '')
+      ]).then(([micro, full, closeup]) => {
+        const newRef = {
+          url,
+          thumbnailUrl: closeup || undefined,
+          microLodThumbnailUrl: micro || undefined,
+          fullDetailThumbnailUrl: full || undefined,
+          closeupThumbnailUrl: closeup || undefined,
+          name: asset.name
+        };
+        const updates: Partial<CardData> = {
+          referenceImages: [...prevRefs, newRef],
+          referenceImageUrl: url,
+          referenceImageName: prevRefs.length > 0 ? `参考图 (${prevRefs.length + 1})` : asset.name,
+          referenceImageFileData: undefined
+        };
+        if (!localPrompt.trim() && asset.description) {
+          setLocalPrompt(asset.description);
+          updates.prompt = asset.description;
+        }
+        onUpdate(id, updates, true);
+      });
+    } else {
+      const updates: Partial<CardData> = {
+        referenceImages: prevRefs,
+        referenceImageUrl: data.referenceImageUrl || null,
+        referenceImageName: prevRefs.length > 0 ? `参考图 (${prevRefs.length + 1})` : asset.name,
+        referenceImageFileData: undefined
+      };
+      if (!localPrompt.trim() && asset.description) {
+        setLocalPrompt(asset.description);
+        updates.prompt = asset.description;
+      }
+      onUpdate(id, updates, true);
     }
-    onUpdate(id, updates, true);
     setShowAssetPicker(false);
   };
 
@@ -517,44 +1045,59 @@ export const GenerationCard = React.memo(function GenerationCard({
     }
   };
 
-  // Asset list items
-  const characterItems = (currentProject?.characters || []).map(c => ({
-    id: `char-${c.id}`,
-    category: 'characters' as const,
-    categoryLabel: '角色',
-    name: c.name,
-    tag: c.role || '角色设定',
-    description: c.appearance || c.performanceNotes || '',
-    referenceImage: c.referenceImage
-  }));
-
-  const locationItems = (currentProject?.locations || []).map(l => ({
-    id: `loc-${l.id}`,
-    category: 'locations' as const,
-    categoryLabel: '场景',
-    name: l.name,
-    tag: `${l.type === 'INT' ? '内景' : '外景'}${l.timeOfDay ? ` · ${l.timeOfDay}` : ''}`,
-    description: l.atmosphere || l.visualDetails || '',
-    referenceImage: l.referenceImage
-  }));
-
-  const propItems = (currentProject?.props || []).map(p => ({
-    id: `prop-${p.id}`,
-    category: 'props' as const,
-    categoryLabel: '道具',
-    name: p.name,
-    tag: p.owner ? `归属: ${p.owner}` : '道具',
-    description: p.materialAndState || p.storySignificance || '',
-    referenceImage: p.referenceImage
-  }));
-
-  const allAssetItems = [...characterItems, ...locationItems, ...propItems];
-  const filteredAssets = allAssetItems.filter(item => {
-    const matchesFilter = assetFilter === 'all' || item.category === assetFilter;
+  // Asset list items (Only computed when Asset Picker modal is opened)
+  const { characterItems, locationItems, propItems, allAssetItems, filteredAssets } = useMemo(() => {
+    if (!showAssetPicker) {
+      return {
+        characterItems: [] as Array<{ id: string; category: 'characters'; categoryLabel: string; name: string; tag: string; description: string; referenceImage?: string }>,
+        locationItems: [] as Array<{ id: string; category: 'locations'; categoryLabel: string; name: string; tag: string; description: string; referenceImage?: string }>,
+        propItems: [] as Array<{ id: string; category: 'props'; categoryLabel: string; name: string; tag: string; description: string; referenceImage?: string }>,
+        allAssetItems: [] as Array<{ id: string; category: 'characters' | 'locations' | 'props'; categoryLabel: string; name: string; tag: string; description: string; referenceImage?: string }>,
+        filteredAssets: [] as Array<{ id: string; category: 'characters' | 'locations' | 'props'; categoryLabel: string; name: string; tag: string; description: string; referenceImage?: string }>
+      };
+    }
+    const chars = (currentProject?.characters || []).map(c => ({
+      id: `char-${c.id}`,
+      category: 'characters' as const,
+      categoryLabel: '角色',
+      name: c.name,
+      tag: c.role || '角色设定',
+      description: c.appearance || c.performanceNotes || '',
+      referenceImage: c.referenceImage
+    }));
+    const locs = (currentProject?.locations || []).map(l => ({
+      id: `loc-${l.id}`,
+      category: 'locations' as const,
+      categoryLabel: '场景',
+      name: l.name,
+      tag: `${l.type === 'INT' ? '内景' : '外景'}${l.timeOfDay ? ` · ${l.timeOfDay}` : ''}`,
+      description: l.atmosphere || l.visualDetails || '',
+      referenceImage: l.referenceImage
+    }));
+    const props = (currentProject?.props || []).map(p => ({
+      id: `prop-${p.id}`,
+      category: 'props' as const,
+      categoryLabel: '道具',
+      name: p.name,
+      tag: p.owner ? `归属: ${p.owner}` : '道具',
+      description: p.materialAndState || p.storySignificance || '',
+      referenceImage: p.referenceImage
+    }));
+    const all = [...chars, ...locs, ...props];
     const q = assetSearch.trim().toLowerCase();
-    const matchesSearch = !q || item.name.toLowerCase().includes(q) || item.tag.toLowerCase().includes(q) || item.description.toLowerCase().includes(q);
-    return matchesFilter && matchesSearch;
-  });
+    const filtered = all.filter(item => {
+      const matchesFilter = assetFilter === 'all' || item.category === assetFilter;
+      const matchesSearch = !q || item.name.toLowerCase().includes(q) || item.tag.toLowerCase().includes(q) || item.description.toLowerCase().includes(q);
+      return matchesFilter && matchesSearch;
+    });
+    return {
+      characterItems: chars,
+      locationItems: locs,
+      propItems: props,
+      allAssetItems: all,
+      filteredAssets: filtered
+    };
+  }, [showAssetPicker, currentProject, assetFilter, assetSearch]);
 
   const canvasCandidates = (allCards || []).filter(c => 
     c.id !== id && Boolean(c.imageUrl || c.originalImageUrl || c.thumbnailUrl)
@@ -566,6 +1109,384 @@ export const GenerationCard = React.memo(function GenerationCard({
     : data.referenceImageUrl
       ? [{ url: data.referenceImageUrl, name: data.referenceImageName, fileData: data.referenceImageFileData }]
       : [];
+
+  // All candidate references and assets (unfiltered for prompt highlighting and parsing)
+  const allMentionItems = useMemo(() => {
+    const items: Array<{
+      id: string;
+      name: string;
+      url?: string;
+      thumbnailUrl?: string;
+      fullDetailThumbnailUrl?: string;
+      fileData?: Blob;
+      source: 'current' | 'character' | 'location' | 'prop';
+      subtitle?: string;
+    }> = [];
+
+    // 1. Current card reference images
+    refList.forEach((r, idx) => {
+      const name = r.name || `参考图 ${idx + 1}`;
+      if (!items.some(it => it.name === name)) {
+        items.push({
+          id: `current-ref-${idx}`,
+          name,
+          url: r.url,
+          thumbnailUrl: r.fullDetailThumbnailUrl || r.thumbnailUrl,
+          fullDetailThumbnailUrl: r.fullDetailThumbnailUrl,
+          fileData: r.fileData,
+          source: 'current',
+          subtitle: '当前卡片参考图',
+        });
+      }
+    });
+
+    // 2. Project Characters
+    (currentProject?.characters || []).forEach(c => {
+      if (!items.some(it => it.name === c.name)) {
+        items.push({
+          id: `char-${c.id}`,
+          name: c.name,
+          url: c.referenceImage,
+          thumbnailUrl: c.referenceImage,
+          source: 'character',
+          subtitle: c.role || '角色',
+        });
+      }
+    });
+
+    // 3. Project Locations
+    (currentProject?.locations || []).forEach(l => {
+      if (!items.some(it => it.name === l.name)) {
+        items.push({
+          id: `loc-${l.id}`,
+          name: l.name,
+          url: l.referenceImage,
+          thumbnailUrl: l.referenceImage,
+          source: 'location',
+          subtitle: '场景',
+        });
+      }
+    });
+
+    // 4. Project Props
+    (currentProject?.props || []).forEach(p => {
+      if (!items.some(it => it.name === p.name)) {
+        items.push({
+          id: `prop-${p.id}`,
+          name: p.name,
+          url: p.referenceImage,
+          thumbnailUrl: p.referenceImage,
+          source: 'prop',
+          subtitle: '道具',
+        });
+      }
+    });
+
+    return items;
+  }, [refList, currentProject]);
+
+  // Filtered mention candidates strictly for the suggestion popup menu
+  const filteredMentionCandidates = useMemo(() => {
+    if (!mentionQuery.trim()) return allMentionItems;
+    const q = mentionQuery.toLowerCase();
+    return allMentionItems.filter(it => it.name.toLowerCase().includes(q) || (it.subtitle && it.subtitle.toLowerCase().includes(q)));
+  }, [allMentionItems, mentionQuery]);
+
+  // Insert mention into prompt with exact spacing: "前后分别空一格"
+  const insertMention = (refItem: { name: string; url?: string; fileData?: Blob }) => {
+    const refName = refItem.name;
+    const textarea = textareaRef.current;
+    const currentPrompt = localPrompt || '';
+    const cursor = textarea?.selectionStart ?? currentPrompt.length;
+
+    const textBeforeCursor = currentPrompt.slice(0, cursor);
+    const textAfterCursor = currentPrompt.slice(cursor);
+    const match = textBeforeCursor.match(/@([^\s@]*)$/);
+
+    let prefix = '';
+    let suffix = textAfterCursor;
+
+    if (match && match.index !== undefined) {
+      prefix = textBeforeCursor.slice(0, match.index);
+    } else {
+      prefix = textBeforeCursor;
+    }
+
+    // Ensure "前后分别空一格":
+    const needsSpaceBefore = prefix.length > 0 && !/\s$/.test(prefix);
+    const needsSpaceAfter = !/^\s/.test(suffix);
+
+    const spaceBefore = needsSpaceBefore ? ' ' : '';
+    const spaceAfter = needsSpaceAfter ? ' ' : '';
+
+    const mentionText = `${spaceBefore}@${refName}${spaceAfter}`;
+    const newPrompt = `${prefix}${mentionText}${suffix}`;
+
+    setLocalPrompt(newPrompt);
+
+    // If item is not in refList and has a URL, automatically attach it to referenceImages
+    const alreadyInRef = refList.some(r => r.name === refName || (r.url && r.url === refItem.url));
+    const updates: Partial<CardData> = { prompt: newPrompt };
+
+    if (!alreadyInRef && refItem.url) {
+      const prevRefs = data.referenceImages && data.referenceImages.length > 0
+        ? [...data.referenceImages]
+        : data.referenceImageUrl
+          ? [{ url: data.referenceImageUrl, name: data.referenceImageName, fileData: data.referenceImageFileData }]
+          : [];
+      const url = refItem.url;
+      Promise.all([
+        generateImageThumbnail(url, 64, 0.90).catch(() => ''),
+        generateImageThumbnail(url, 128, 0.90).catch(() => ''),
+        generateImageThumbnail(url, 256, 0.90).catch(() => '')
+      ]).then(([micro, full, closeup]) => {
+        const newRef = {
+          url,
+          thumbnailUrl: closeup || undefined,
+          microLodThumbnailUrl: micro || undefined,
+          fullDetailThumbnailUrl: full || undefined,
+          closeupThumbnailUrl: closeup || undefined,
+          name: refItem.name,
+          fileData: refItem.fileData
+        };
+        const upd: Partial<CardData> = {
+          ...updates,
+          referenceImages: [...prevRefs, newRef],
+          referenceImageUrl: prevRefs.length === 0 ? url : data.referenceImageUrl,
+          referenceImageName: prevRefs.length === 0 ? refItem.name : data.referenceImageName
+        };
+        onUpdate(id, upd);
+      });
+    } else {
+      onUpdate(id, updates);
+    }
+
+    setMentionMenuOpen(false);
+
+    // Restore focus and cursor position after insertion
+    setTimeout(() => {
+      if (textareaRef.current) {
+        textareaRef.current.focus();
+        const newCursor = prefix.length + mentionText.length;
+        textareaRef.current.setSelectionRange(newCursor, newCursor);
+      }
+    }, 10);
+  };
+
+  // Close mention menu when clicking outside
+  useEffect(() => {
+    if (!mentionMenuOpen) return;
+
+    const handlePointerDownOutside = (e: MouseEvent | TouchEvent) => {
+      const target = e.target as Node | null;
+      if (!target) return;
+      if (mentionMenuRef.current && mentionMenuRef.current.contains(target)) {
+        return;
+      }
+      if (textareaRef.current && textareaRef.current.contains(target)) {
+        return;
+      }
+      setMentionMenuOpen(false);
+    };
+
+    document.addEventListener('mousedown', handlePointerDownOutside);
+    document.addEventListener('touchstart', handlePointerDownOutside);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDownOutside);
+      document.removeEventListener('touchstart', handlePointerDownOutside);
+    };
+  }, [mentionMenuOpen]);
+
+  const checkCursorMention = (val: string, cursor: number) => {
+    const textBeforeCursor = val.slice(0, cursor);
+    const match = textBeforeCursor.match(/@([^\s@]*)$/);
+    if (match) {
+      const query = match[1];
+      // Check if this is already an exact completed mention name
+      const isExactCompleted = query.length > 0 && allMentionItems.some(item => item.name === query);
+      if (!isExactCompleted) {
+        setMentionMenuOpen(true);
+        setMentionQuery(query);
+        setSelectedMentionIndex(0);
+        return;
+      }
+    }
+    setMentionMenuOpen(false);
+  };
+
+  const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const val = e.target.value;
+    const cursor = e.target.selectionStart;
+    isTypingRef.current = true;
+    setLocalPrompt(val);
+
+    // Debounce syncing upstream to App.tsx & IndexedDB
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+    debounceTimerRef.current = setTimeout(() => {
+      onUpdate(id, { prompt: val }, false);
+      debounceTimerRef.current = null;
+    }, 250);
+
+    checkCursorMention(val, cursor);
+  };
+
+  const handleTextareaBlur = () => {
+    isTypingRef.current = false;
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
+      onUpdate(id, { prompt: localPromptRef.current }, false);
+    }
+  };
+
+  const handleTextareaKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (mentionMenuOpen && filteredMentionCandidates.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setSelectedMentionIndex(prev => (prev + 1) % filteredMentionCandidates.length);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setSelectedMentionIndex(prev => (prev - 1 + filteredMentionCandidates.length) % filteredMentionCandidates.length);
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        const selected = filteredMentionCandidates[selectedMentionIndex];
+        if (selected) {
+          insertMention(selected);
+        }
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setMentionMenuOpen(false);
+        return;
+      }
+    }
+
+    // Atomic Backspace for @ reference mentions ("退格删除参考图任意一个字符时触发")
+    if (e.key === 'Backspace') {
+      const textarea = textareaRef.current;
+      if (textarea && textarea.selectionStart === textarea.selectionEnd) {
+        const cursor = textarea.selectionStart;
+        const currentPrompt = localPrompt || '';
+
+        // Find all reference mentions in currentPrompt
+        const candidateNames = allMentionItems
+          .map(c => c.name)
+          .filter(Boolean)
+          .sort((a, b) => b.length - a.length);
+
+        let targetMention: { start: number; deleteEnd: number } | null = null;
+
+        // Check mentions strictly from valid candidateNames
+        if (candidateNames.length > 0) {
+          const escapedNames = candidateNames
+            .map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+            .join('|');
+          const regex = new RegExp(`@(?:${escapedNames})`, 'g');
+          let m: RegExpExecArray | null;
+
+          while ((m = regex.exec(currentPrompt)) !== null) {
+            const start = m.index;
+            const nameEnd = start + m[0].length;
+
+            // Trigger atomic backspace strictly when backspacing would delete any character of the reference name itself:
+            // cursor - 1 is a character of the reference name (between start + 1 and nameEnd).
+            // Any deletion in subsequent prompt text or trailing spaces is handled normally by native backspace.
+            if (cursor > start + 1 && cursor <= nameEnd) {
+              targetMention = { start, deleteEnd: nameEnd };
+              break;
+            }
+          }
+        }
+
+        if (targetMention) {
+          e.preventDefault();
+
+          // Retain the '@' symbol: delete the reference name, leaving '@' and keeping all other prompt content
+          const newCursor = targetMention.start + 1;
+          const newPrompt = currentPrompt.slice(0, newCursor) + currentPrompt.slice(targetMention.deleteEnd);
+          commitPrompt(newPrompt);
+
+          // Re-open mention candidates menu at the retained @ symbol with empty query
+          setMentionMenuOpen(true);
+          setMentionQuery('');
+          setSelectedMentionIndex(0);
+
+          // Position cursor directly after the preserved @ symbol
+          setTimeout(() => {
+            if (textareaRef.current) {
+              textareaRef.current.focus();
+              textareaRef.current.setSelectionRange(newCursor, newCursor);
+            }
+          }, 0);
+          return;
+        }
+      }
+    }
+  };
+
+  // Close mention menu when clicking outside
+  useEffect(() => {
+    if (!mentionMenuOpen) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (
+        mentionMenuRef.current &&
+        !mentionMenuRef.current.contains(e.target as Node) &&
+        textareaRef.current &&
+        !textareaRef.current.contains(e.target as Node)
+      ) {
+        setMentionMenuOpen(false);
+      }
+    };
+    window.addEventListener('mousedown', handleClickOutside);
+    return () => window.removeEventListener('mousedown', handleClickOutside);
+  }, [mentionMenuOpen]);
+
+  // Render prompt with mentions highlighted in blue
+  const renderHighlightedPrompt = (text: string) => {
+    if (!text) return null;
+
+    // Use full list of candidate references so typing never filters out highlights
+    const names = allMentionItems
+      .map(c => c.name)
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length);
+
+    if (names.length === 0) {
+      return <span>{text}</span>;
+    }
+
+    const escapedNames = names
+      .map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .join('|');
+
+    // Match exact @Name references without requiring trailing lookahead so typing directly after never breaks highlight
+    const pattern = new RegExp(`(@(?:${escapedNames}))`, 'g');
+    const validMentionTags = new Set(names.map(n => `@${n}`));
+
+    const parts = text.split(pattern);
+
+    return parts.map((part, i) => {
+      // Only highlight if it matches an actual reference and is not a bare '@'
+      if (validMentionTags.has(part)) {
+        return (
+          <span
+            key={i}
+            className="text-[#2563eb] dark:text-blue-400 font-medium bg-blue-500/15 dark:bg-blue-400/20 rounded-xs"
+          >
+            {part}
+          </span>
+        );
+      }
+      return <span key={i}>{part}</span>;
+    });
+  };
 
   let resolutionTag = '';
   if (data.nativeWidth && data.nativeHeight) {
@@ -598,6 +1519,43 @@ export const GenerationCard = React.memo(function GenerationCard({
   const ratios: AspectRatio[] = ['1:1', '3:4', '9:16', '16:9'];
   const resolutions: Resolution[] = ['1K', '2K', '4K'];
 
+  // Dynamic height calculation based on hovered reference image aspect ratio
+  const textareaHeight = textareaRef.current?.offsetHeight || 50;
+  const targetPreviewHeight = previewDimensions
+    ? Math.min(280, Math.max(80, Math.round(448 / (previewDimensions.width / previewDimensions.height))))
+    : 200;
+  const expandedPromptHeight = (hoveredRefUrl || activePreviewUrl) ? Math.max(textareaHeight, targetPreviewHeight) : 'auto';
+
+  const handleExitComplete = () => {
+    if (reboundTimerRef.current) {
+      clearTimeout(reboundTimerRef.current);
+      reboundTimerRef.current = null;
+    }
+
+    const currentTextareaHeight = textareaRef.current?.offsetHeight || 50;
+    const currentPreviewHeight = previewDimensions
+      ? Math.min(280, Math.max(80, Math.round(448 / (previewDimensions.width / previewDimensions.height))))
+      : 200;
+
+    // "当然，我说的是提示词区域本身高度不够的情况下，如果本来就够，没有被大图撑高，就不用回弹了"
+    const wasStretched = currentPreviewHeight > currentTextareaHeight;
+
+    if (!wasStretched) {
+      setActivePreviewUrl(null);
+      setIsRebounding(false);
+      return;
+    }
+
+    // "可以在大图缩小后稍等300ms，再回弹"
+    reboundTimerRef.current = setTimeout(() => {
+      setIsRebounding(true);
+      setActivePreviewUrl(null);
+      setTimeout(() => {
+        setIsRebounding(false);
+      }, 250);
+    }, 300);
+  };
+
   return (
     <motion.div 
       ref={cardRef}
@@ -617,12 +1575,12 @@ export const GenerationCard = React.memo(function GenerationCard({
           damping: 22, 
           mass: 0.7 
         }}
-        className="flex flex-col gap-3 group items-start"
+        className={`flex flex-col gap-3 group items-start ${isAssetCard ? 'asset-card' : 'generation-card'}`}
         style={{ transformOrigin: '50% 50%' }}
       >
         {/* Top Layer: Image Placeholder & Drag Handle */}
         <div 
-          className={`pointer-events-auto relative shrink-0 overflow-hidden cursor-grab active:cursor-grabbing bg-gray-100 dark:bg-neutral-800 squircle self-start ease-out group-data-[zooming=true]/canvas:!shadow-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform ${
+          className={`pointer-events-auto relative shrink-0 overflow-hidden cursor-grab active:cursor-grabbing bg-gray-100 dark:bg-neutral-800 squircle self-start ease-out ${
             pickerSelectionIndex && pickerSelectionIndex > 0
               ? 'outline outline-[4px] outline-[#2563eb] shadow-[0_0_25px_rgba(37,99,235,0.7)] scale-[1.015]'
               : isPickerTarget
@@ -668,7 +1626,7 @@ export const GenerationCard = React.memo(function GenerationCard({
         {/* File Name Tag */}
         {data.fileName && (
           <div 
-            className="absolute z-[60] pointer-events-none group-data-[scale-micro=true]/canvas:opacity-0 transition-opacity duration-300"
+            className="absolute z-[60] pointer-events-none asset-heavy-dom"
             style={{
               top: 'calc(12px / var(--current-scale, 1))',
               left: 'calc(12px / var(--current-scale, 1))',
@@ -688,7 +1646,7 @@ export const GenerationCard = React.memo(function GenerationCard({
         {/* Resolution Tag */}
         {resolutionTag && (
           <div 
-            className="absolute z-[60] pointer-events-none group-data-[scale-micro=true]/canvas:opacity-0 transition-opacity duration-300"
+            className="absolute z-[60] pointer-events-none asset-heavy-dom"
             style={{
               top: 'calc(12px / var(--current-scale, 1))',
               right: 'calc(12px / var(--current-scale, 1))',
@@ -718,9 +1676,52 @@ export const GenerationCard = React.memo(function GenerationCard({
         {imageUrl && (
           isVideo ? (
             <div 
+              ref={videoContainerRef}
               className="absolute inset-0 overflow-hidden squircle pointer-events-auto"
-              onMouseEnter={() => setIsHovered(true)}
-              onMouseLeave={() => setIsHovered(false)}
+              onPointerDown={(e) => {
+                // If middle click (pan) or right click, immediately drop hover to unmount video
+                if (e.button === 1 || e.button === 2) {
+                  if (!isPlaying) {
+                    setIsHovered(false);
+                  } else if (videoRef.current && !videoRef.current.paused) {
+                    videoRef.current.pause();
+                  }
+                }
+              }}
+              onMouseEnter={() => {
+                const workspace = document.getElementById('canvas-workspace');
+                if (
+                  workspace?.getAttribute('data-gesture') === 'true' || 
+                  workspace?.getAttribute('data-panning') === 'true' || 
+                  workspace?.getAttribute('data-zooming') === 'true'
+                ) {
+                  return;
+                }
+                setIsHovered(true);
+              }}
+              onMouseMove={() => {
+                const workspace = document.getElementById('canvas-workspace');
+                if (
+                  workspace?.getAttribute('data-gesture') === 'true' || 
+                  workspace?.getAttribute('data-panning') === 'true' || 
+                  workspace?.getAttribute('data-zooming') === 'true'
+                ) {
+                  return;
+                }
+                if (!isHovered) {
+                  setIsHovered(true);
+                }
+              }}
+              onMouseLeave={() => {
+                const workspace = document.getElementById('canvas-workspace');
+                const isCanvasMotion = 
+                  workspace?.getAttribute('data-gesture') === 'true' || 
+                  workspace?.getAttribute('data-panning') === 'true' || 
+                  workspace?.getAttribute('data-zooming') === 'true';
+                if (!isCanvasMotion && !isPlaying) {
+                  setIsHovered(false);
+                }
+              }}
               style={{
                 width: w * dpr,
                 height: h * dpr,
@@ -736,11 +1737,12 @@ export const GenerationCard = React.memo(function GenerationCard({
                   <motion.video 
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
+                  transition={{ duration: 0.5, ease: 'easeOut' }}
                   ref={videoRef}
                   src={imageUrl} 
                   loop 
                   playsInline
-                  className="absolute inset-0 w-full h-full object-cover pointer-events-none transition-opacity duration-700 group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform group-data-[zooming=true]/canvas:!opacity-0"
+                  className="absolute inset-0 w-full h-full object-cover pointer-events-none transition-opacity duration-500 group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform group-data-[zooming=true]/canvas:!opacity-0 group-data-[zooming=true]/canvas:!invisible group-data-[panning=true]/canvas:!transition-none group-data-[panning=true]/canvas:!duration-0 group-data-[panning=true]/canvas:!opacity-0 group-data-[panning=true]/canvas:!invisible group-data-[gesture=true]/canvas:!transition-none group-data-[gesture=true]/canvas:!duration-0 group-data-[gesture=true]/canvas:!opacity-0 group-data-[gesture=true]/canvas:!invisible"
                   onLoadedMetadata={(e) => {
                     const video = e.currentTarget;
                     setDuration(video.duration || 0);
@@ -767,13 +1769,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                     }
                   }}
                   onPause={(e) => {
-                    const video = e.currentTarget;
-                    const currTime = video.currentTime;
-                    lastSavedTimeRef.current = currTime;
-                    const updates: Partial<CardData> = { currentTime: currTime };
-                    const thumbUrl = generateThumbnail(video);
-                    if (thumbUrl) updates.thumbnailUrl = thumbUrl;
-                    onUpdate(id, updates, false);
+                    captureAndSaveVideoState(e.currentTarget);
                   }}
                 />
                 )}
@@ -795,6 +1791,10 @@ export const GenerationCard = React.memo(function GenerationCard({
                           // Prevent card drag only on left-click of play button, allow middle click to pan
                           if (e.button === 0) {
                             e.stopPropagation();
+                          } else if (e.button === 1 || e.button === 2) {
+                            if (!isPlaying) {
+                              setIsHovered(false);
+                            }
                           }
                         }}
                         onClick={(e) => {
@@ -846,9 +1846,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                             if (videoRef.current) {
                               videoRef.current.pause();
                               setIsPlaying(false);
-                              const currTime = videoRef.current.currentTime;
-                              lastSavedTimeRef.current = currTime;
-                              onUpdate(id, { currentTime: currTime }, false);
+                              captureAndSaveVideoState(videoRef.current);
                             }
                           }}
                         >
@@ -893,9 +1891,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                           if (isPlaying) {
                             videoRef.current.pause();
                             setIsPlaying(false);
-                            const currTime = videoRef.current.currentTime;
-                            lastSavedTimeRef.current = currTime;
-                            onUpdate(id, { currentTime: currTime }, false);
+                            captureAndSaveVideoState(videoRef.current);
                           } else {
                             videoRef.current.play();
                             setIsPlaying(true);
@@ -927,8 +1923,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                         if (videoRef.current && duration) {
                           const targetTime = (pct / 100) * duration;
                           videoRef.current.currentTime = targetTime;
-                          lastSavedTimeRef.current = targetTime;
-                          onUpdate(id, { currentTime: targetTime }, false);
+                          captureAndSaveVideoState(videoRef.current);
                         }
                       }}
                       className="w-full h-1 bg-transparent rounded-lg appearance-none cursor-pointer accent-blue-500 focus:outline-none [&::-webkit-slider-runnable-track]:bg-white/20 [&::-webkit-slider-runnable-track]:h-1 [&::-webkit-slider-runnable-track]:rounded-lg [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-500 hover:[&::-webkit-slider-thumb]:scale-125 [&::-webkit-slider-thumb]:-translate-y-[4px]"
@@ -981,10 +1976,10 @@ export const GenerationCard = React.memo(function GenerationCard({
         </AnimatePresence>
       </div>
 
-      {/* Bottom Layer: Light Panel (Hidden for local uploaded images) */}
-      {!data.fileData && !data.originalFileData && (
+      {/* Bottom Layer: Light Panel (Intent-driven lazy mounted for generation cards) */}
+      {shouldRenderBottomPanel && (
       <div 
-        className={`pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 squircle p-4 gap-2 w-[480px] border border-gray-200/80 dark:border-[#404040] cursor-default self-start ease-out group-data-[scale-micro=true]/canvas:!opacity-0 group-data-[scale-micro=true]/canvas:!pointer-events-none group-data-[zooming=true]/canvas:!shadow-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform ${
+        className={`pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 squircle p-4 gap-2 w-[480px] border border-gray-200/80 dark:border-[#404040] cursor-default self-start ease-out group-data-[scale-micro=true]/canvas:!opacity-0 group-data-[scale-micro=true]/canvas:!pointer-events-none ${
         state === 'completed' && !isSelected ? 'opacity-0 pointer-events-none' : 'opacity-100'
       } ${
         isSelected 
@@ -1000,65 +1995,34 @@ export const GenerationCard = React.memo(function GenerationCard({
         
         {/* Top: Reference & Actions */}
         <div className="flex items-start justify-between relative" ref={refMenuContainerRef}>
-          <div className="relative flex items-center gap-1.5 flex-wrap max-w-[280px]">
-            {refList.length > 0 ? (
-              <div className="flex items-center gap-1.5 bg-gray-200/70 dark:bg-neutral-700/70 border border-gray-300/80 dark:border-neutral-600 pl-1.5 pr-1.5 py-1 rounded-xl corner-squircle text-[12px] font-medium text-gray-800 dark:text-neutral-200 shadow-sm transition-all">
-                {/* Stacked thumbnails */}
-                <div className="flex items-center -space-x-2">
-                  {refList.slice(0, 3).map((item, idx) => (
-                    <img 
-                      key={idx}
-                      src={item.url} 
-                      alt={item.name || `参考图 ${idx + 1}`} 
-                      className="w-5 h-5 rounded-md object-cover border border-white dark:border-neutral-800 shadow-xs" 
-                    />
-                  ))}
-                </div>
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    const isAgent = !e.nativeEvent.isTrusted;
-                    setOpenMenu(prev => prev?.type === 'ref' ? null : { type: 'ref', ownerId: isAgent ? 'agent' : 'user' });
-                  }}
-                  className="hover:underline flex items-center gap-1 max-w-[110px] truncate text-left pl-0.5"
-                  title="点击添加或更换参考图"
-                >
-                  <span className="truncate">
-                    {refList.length === 1 ? (refList[0].name || '参考图') : `参考图 (${refList.length})`}
-                  </span>
-                  <ChevronDown className="w-3 h-3 opacity-60 flex-shrink-0" />
-                </button>
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (refList.length > 1) {
-                      onUpdate(id, { referenceImages: [], referenceImageUrl: null, referenceImageFileData: undefined, referenceImageName: undefined }, true);
-                    } else {
-                      removeReferenceImage(0);
-                    }
-                  }}
-                  className="ml-0.5 p-0.5 rounded-md hover:bg-gray-300 dark:hover:bg-neutral-600 text-gray-400 hover:text-red-500 transition-colors"
-                  title="移除参考图"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            ) : (
-              <button 
-                type="button"
-                data-agent-target={`ref-btn-${id}`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  const isAgent = !e.nativeEvent.isTrusted;
-                  setOpenMenu(prev => prev?.type === 'ref' ? null : { type: 'ref', ownerId: isAgent ? 'agent' : 'user' });
-                }}
-                className={`flex items-center gap-1.5 bg-gray-100 dark:bg-neutral-800 hover:bg-gray-200 dark:hover:bg-neutral-700 border border-gray-200 dark:border-[#404040] text-gray-700 dark:text-neutral-300 px-3 py-1.5 rounded-xl corner-squircle text-[12px] font-medium transition-colors shadow-sm group-data-[zooming=true]/canvas:!shadow-none ${openMenu?.type === 'ref' ? 'ring-2 ring-blue-500/50 dark:ring-blue-400/50' : ''}`}
-              >
-                <Plus className="w-3.5 h-3.5" /> 参考图
-              </button>
-            )}
+          <div className="relative flex items-center gap-2 flex-wrap w-full">
+            {refList.map((item, idx) => (
+              <ReferenceThumbItem
+                key={item.url || idx}
+                item={item}
+                idx={idx}
+                currentScale={currentScale}
+                removeReferenceImage={removeReferenceImage}
+                setOpenMenu={setOpenMenu}
+                setHoveredRefUrl={setHoveredRefUrl}
+                onMentionItem={insertMention}
+              />
+            ))}
+
+            {/* Add button following on the right */}
+            <button 
+              type="button"
+              data-agent-target={`ref-btn-${id}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                const isAgent = !e.nativeEvent.isTrusted;
+                setOpenMenu(prev => prev?.type === 'ref' ? null : { type: 'ref', ownerId: isAgent ? 'agent' : 'user' });
+              }}
+              className={`w-12 h-12 flex flex-col items-center justify-center border-2 border-dashed border-gray-300 dark:border-neutral-700 hover:border-gray-450 dark:hover:border-neutral-500 bg-gray-50/50 dark:bg-neutral-800/40 hover:bg-gray-100/80 dark:hover:bg-neutral-800/80 rounded-lg text-gray-500 hover:text-gray-700 dark:hover:text-neutral-300 transition-all cursor-pointer ${openMenu?.type === 'ref' ? 'ring-2 ring-blue-500/50 dark:ring-blue-400/50' : ''}`}
+              title="添加参考图"
+            >
+              <Plus className="w-4 h-4" />
+            </button>
 
             {/* Dropdown with 3 options: 本地上传, 资产列表, 画布导入 */}
             <AnimatePresence>
@@ -1142,42 +2106,186 @@ export const GenerationCard = React.memo(function GenerationCard({
             </div>
           )}
 
-          {/* Default selection delete button */}
-          {isSelected && !isPickerSelectable && (
-            <button 
-              type="button"
-              onClick={() => onDelete?.(id)}
-              className="text-gray-400 dark:text-neutral-500 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950 p-1.5 rounded-lg corner-squircle transition-colors"
-              title="删除 (Backspace/Delete)"
-            >
-              <Trash2 className="w-4 h-4" />
-            </button>
-          )}
+          {/* Default selection delete button removed to leave space for reference images */}
         </div>
 
         {/* Middle: Prompt Textarea */}
-        <textarea
-          ref={textareaRef}
-          data-agent-target={`prompt-input-${id}`}
-          value={prompt}
-          onPointerDown={(e) => {
-            // Prevent middle-click from focusing the textarea so canvas panning works smoothly
-            if (e.button === 1) {
-              e.preventDefault();
-            }
+        <div 
+          ref={promptContainerRef}
+          className="relative w-full mt-1 min-h-[50px] flex items-center"
+          style={{
+            height: activePreviewUrl
+              ? expandedPromptHeight
+              : isRebounding
+                ? textareaHeight
+                : undefined,
+            transition: isRebounding ? 'height 0.24s cubic-bezier(0.16, 1, 0.3, 1)' : 'none',
           }}
-          onChange={(e) => onUpdate(id, { prompt: e.target.value })}
-          disabled={state === 'generating'}
-          placeholder="输入文字指令，例如：清冷克制的女主，穿白衬衫..."
-          className="w-full bg-transparent border-0 text-gray-800 dark:text-neutral-100 placeholder-gray-400 dark:placeholder-neutral-500 text-[14px] leading-relaxed resize-none focus:outline-none min-h-[50px] max-h-[300px] overflow-hidden font-medium mt-1"
-          rows={2}
-        />
+        >
+          {/* Highlight mirror backdrop */}
+          <div
+            ref={mirrorRef}
+            aria-hidden="true"
+            className="absolute inset-0 pointer-events-none text-gray-800 dark:text-neutral-100 text-[14px] leading-[22px] font-medium p-0 m-0 border-0 select-none overflow-hidden no-scrollbar"
+            style={{
+              wordBreak: 'break-all',
+              lineBreak: 'anywhere',
+              overflowWrap: 'anywhere',
+              whiteSpace: 'pre-wrap',
+              fontFamily: 'inherit',
+              letterSpacing: 'normal',
+              lineHeight: '22px',
+              boxSizing: 'border-box',
+              scrollbarWidth: 'none',
+              msOverflowStyle: 'none',
+            }}
+          >
+            {renderHighlightedPrompt(localPrompt)}
+            {localPrompt?.endsWith('\n') && <br />}
+          </div>
+
+          <textarea
+            ref={textareaRef}
+            data-agent-target={`prompt-input-${id}`}
+            value={localPrompt}
+            onPointerDown={(e) => {
+              // Prevent middle-click from focusing the textarea so canvas panning works smoothly
+              if (e.button === 1) {
+                e.preventDefault();
+              }
+            }}
+            onChange={handleTextareaChange}
+            onBlur={handleTextareaBlur}
+            onKeyDown={handleTextareaKeyDown}
+            onClick={(e) => checkCursorMention(e.currentTarget.value, e.currentTarget.selectionStart)}
+            onSelect={(e) => checkCursorMention(e.currentTarget.value, e.currentTarget.selectionStart)}
+            onKeyUp={(e) => {
+              if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(e.key)) {
+                checkCursorMention(e.currentTarget.value, e.currentTarget.selectionStart);
+              }
+            }}
+            onScroll={() => {
+              if (mirrorRef.current && textareaRef.current) {
+                mirrorRef.current.scrollTop = textareaRef.current.scrollTop;
+              }
+            }}
+            disabled={state === 'generating'}
+            placeholder="输入文字指令，例如：清冷克制的女主，穿白衬衫..."
+            className="relative z-10 w-full bg-transparent border-0 text-transparent caret-gray-800 dark:caret-neutral-100 selection:bg-blue-500/25 selection:text-transparent placeholder:text-gray-400 dark:placeholder:text-neutral-500 text-[14px] leading-[22px] resize-none focus:outline-none min-h-[50px] max-h-[300px] font-medium block p-0 m-0 no-scrollbar"
+            style={{
+              wordBreak: 'break-all',
+              lineBreak: 'anywhere',
+              overflowWrap: 'anywhere',
+              whiteSpace: 'pre-wrap',
+              fontFamily: 'inherit',
+              letterSpacing: 'normal',
+              lineHeight: '22px',
+              boxSizing: 'border-box',
+              scrollbarWidth: 'none',
+              msOverflowStyle: 'none',
+            }}
+            rows={2}
+          />
+
+          {/* @ Mention Suggestion Dropdown */}
+          {mentionMenuOpen && (
+            <div
+              ref={mentionMenuRef}
+              className="absolute left-0 bottom-full mb-2 w-72 max-h-64 bg-white dark:bg-neutral-900 border border-gray-200 dark:border-neutral-700 rounded-xl shadow-xl overflow-hidden z-50 flex flex-col py-1 animate-in fade-in zoom-in-95 duration-100"
+            >
+              <div className="px-3 py-1.5 text-[11px] font-semibold text-gray-400 dark:text-neutral-500 uppercase tracking-wider border-b border-gray-100 dark:border-neutral-800 flex items-center justify-between">
+                <span>选择参考图引用</span>
+                <span className="text-[10px] font-normal text-gray-400">↑↓ 选择 · Enter 确定</span>
+              </div>
+              <div className="overflow-y-auto max-h-52 divide-y divide-gray-50 dark:divide-neutral-800/40">
+                {filteredMentionCandidates.length > 0 ? (
+                  filteredMentionCandidates.map((c, idx) => (
+                    <button
+                      key={c.id}
+                      type="button"
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        insertMention(c);
+                      }}
+                      className={`w-full px-3 py-2 flex items-center gap-2.5 text-left transition-colors cursor-pointer ${
+                        idx === selectedMentionIndex
+                          ? 'bg-blue-50 dark:bg-blue-950/40 text-blue-600 dark:text-blue-400'
+                          : 'hover:bg-gray-50 dark:hover:bg-neutral-800/60 text-gray-700 dark:text-neutral-200'
+                      }`}
+                    >
+                      <div className="w-8 h-8 rounded-md bg-gray-100 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 flex items-center justify-center overflow-hidden shrink-0">
+                        <MentionCandidateAvatar item={c} />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-[13px] font-semibold truncate flex items-center gap-1">
+                          <span className="text-blue-500 font-bold">@</span>
+                          <span className="truncate">{c.name}</span>
+                        </div>
+                        {c.subtitle && (
+                          <div className="text-[11px] text-gray-400 dark:text-neutral-500 truncate">
+                            {c.subtitle}
+                          </div>
+                        )}
+                      </div>
+                    </button>
+                  ))
+                ) : (
+                  <div className="px-4 py-4 text-center text-xs text-gray-400 dark:text-neutral-500">
+                    暂无可引用的参考图或角色
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          
+          {/* Direct large image with frosted glass backdrop: opacity fade-in and fade-out (no scale, no rounded corners) */}
+          <AnimatePresence onExitComplete={handleExitComplete}>
+            {hoveredRefUrl && (
+              <motion.div
+                key="large-ref-preview"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.16, ease: 'easeOut' }}
+                className="absolute inset-0 z-30 pointer-events-none flex items-center justify-center overflow-hidden shadow-md transform-gpu"
+              >
+                {/* Frosted glass mask without rounded corners */}
+                <div className="absolute inset-0 backdrop-blur-md bg-gray-100/90 dark:bg-neutral-800/90" />
+
+                {/* Direct large image without rounded corners */}
+                <img 
+                  src={hoveredRefUrl} 
+                  alt="Reference Preview" 
+                  className="relative z-10 w-full h-full object-contain pointer-events-none select-none"
+                  referrerPolicy="no-referrer"
+                />
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
 
         {/* Bottom Action Bar */}
         <div className="flex items-center justify-between mt-2 pt-2 border-t border-gray-100 dark:border-[#404040]">
           
           {/* Left Controls: Parameters */}
-          <div ref={menuContainerRef} className="flex items-center gap-4 text-gray-500 dark:text-neutral-400 text-[13px]">
+          <div ref={menuContainerRef} className="flex items-center gap-3 text-gray-500 dark:text-neutral-400 text-[13px]">
+            {/* Quick @ mention button */}
+            <button
+              type="button"
+              data-agent-target={`mention-btn-${id}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                if (textareaRef.current) {
+                  textareaRef.current.focus();
+                }
+                setMentionMenuOpen(prev => !prev);
+              }}
+              className="flex items-center gap-1 text-[12px] font-medium text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 dark:hover:bg-blue-900/40 px-2 py-0.5 rounded-md transition-colors cursor-pointer"
+              title="在提示词中@参考图"
+            >
+              <span className="font-bold text-[13px]">@</span>
+              <span className="text-[12px]">引用</span>
+            </button>
             {/* Ratio Dropdown */}
             <div className="relative">
               <button
@@ -1263,7 +2371,7 @@ export const GenerationCard = React.memo(function GenerationCard({
           <button
             data-agent-target={`generate-btn-${id}`}
             onClick={handleGenerate}
-            disabled={!prompt.trim() || state === 'generating'}
+            disabled={!localPrompt.trim() || state === 'generating'}
             className="w-8 h-8 rounded-full bg-gray-900 dark:bg-neutral-100 text-white dark:text-neutral-900 flex items-center justify-center hover:bg-black dark:hover:bg-white/10 disabled:opacity-50 transition-colors shadow-md"
           >
             <ArrowUp className="w-4 h-4 stroke-[3]" />

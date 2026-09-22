@@ -4,7 +4,7 @@
  * fully portable to PixiJS / WebGL / Canvas / Worker environments.
  */
 
-export const MAX_THUMBNAIL_EDGE = 256;
+export const MAX_THUMBNAIL_EDGE = 480;
 
 // In-memory string cache for thumbnail Data URLs (media/card id -> DataURL)
 export const thumbCache = new Map<string, string>();
@@ -16,8 +16,68 @@ export const thumbImageCache = new Map<string, HTMLImageElement>();
 const pendingThumbnailIds = new Set<string>();
 
 /**
+ * Multi-step progressive downscaling to prevent aliasing, blurriness, and moire
+ * when downsampling large 2K/4K media down to thumbnail dimensions.
+ */
+function drawImageHighQuality(
+  ctx: CanvasRenderingContext2D,
+  source: HTMLImageElement | HTMLVideoElement,
+  targetW: number,
+  targetH: number
+) {
+  const curW = source instanceof HTMLVideoElement ? (source.videoWidth || targetW) : (source.naturalWidth || targetW);
+  const curH = source instanceof HTMLVideoElement ? (source.videoHeight || targetH) : (source.naturalHeight || targetH);
+
+  // If within 2x of target, draw directly with high quality smoothing
+  if (curW <= targetW * 2 && curH <= targetH * 2) {
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(source, 0, 0, targetW, targetH);
+    return;
+  }
+
+  // Progressive half-step downsampling for extreme downscales to preserve sharp details
+  let curCanvas = document.createElement('canvas');
+  curCanvas.width = curW;
+  curCanvas.height = curH;
+  const curCtx = curCanvas.getContext('2d');
+  if (!curCtx) {
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(source, 0, 0, targetW, targetH);
+    return;
+  }
+  curCtx.imageSmoothingEnabled = true;
+  curCtx.imageSmoothingQuality = 'high';
+  curCtx.drawImage(source, 0, 0);
+
+  let stepW = curW;
+  let stepH = curH;
+  while (stepW > targetW * 2 || stepH > targetH * 2) {
+    const nextW = Math.max(targetW, Math.floor(stepW / 2));
+    const nextH = Math.max(targetH, Math.floor(stepH / 2));
+    const nextCanvas = document.createElement('canvas');
+    nextCanvas.width = nextW;
+    nextCanvas.height = nextH;
+    const nextCtx = nextCanvas.getContext('2d');
+    if (!nextCtx) break;
+    nextCtx.imageSmoothingEnabled = true;
+    nextCtx.imageSmoothingQuality = 'high';
+    nextCtx.drawImage(curCanvas, 0, 0, nextW, nextH);
+
+    curCanvas = nextCanvas;
+    stepW = nextW;
+    stepH = nextH;
+  }
+
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(curCanvas, 0, 0, targetW, targetH);
+}
+
+/**
  * Calculate proportional thumbnail dimensions preserving aspect ratio without distortion.
- * Longest edge is strictly capped at maxEdge (default: 64px).
+ * Longest edge is strictly capped at maxEdge (default: 480px).
  */
 export function getThumbnailDimensions(
   origW: number,
@@ -41,12 +101,12 @@ export function getThumbnailDimensions(
 }
 
 /**
- * Generate an ultra-compact (~1KB-2KB) JPEG thumbnail from an image source.
+ * Generate a crisp, high-definition thumbnail preserving fine lines and faces.
  */
 export async function generateImageThumbnail(
   imageSource: string | Blob,
   maxEdge: number = MAX_THUMBNAIL_EDGE,
-  quality: number = 0.75
+  quality: number = 0.90
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -93,8 +153,16 @@ export async function generateImageThumbnail(
           return reject(new Error('2D context unavailable'));
         }
 
-        ctx.drawImage(img, 0, 0, tw, th);
-        const dataUrl = canvas.toDataURL('image/jpeg', quality);
+        drawImageHighQuality(ctx, img, tw, th);
+        let dataUrl = '';
+        try {
+          dataUrl = canvas.toDataURL('image/webp', quality);
+          if (!dataUrl.startsWith('data:image/webp')) {
+            dataUrl = canvas.toDataURL('image/jpeg', quality);
+          }
+        } catch {
+          dataUrl = canvas.toDataURL('image/jpeg', quality);
+        }
         cleanup();
         resolve(dataUrl);
       } catch (err) {
@@ -111,13 +179,13 @@ export async function generateImageThumbnail(
 }
 
 /**
- * Generate a 64px first-frame thumbnail from a video source using a temporary offscreen element.
+ * Generate a crisp first-frame thumbnail from a video source using a temporary offscreen element.
  * Completely unloads the video element afterwards to avoid hardware decoder allocation limits.
  */
 export async function generateVideoThumbnail(
   videoSource: string | Blob,
   maxEdge: number = MAX_THUMBNAIL_EDGE,
-  quality: number = 0.75
+  quality: number = 0.90
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const video = document.createElement('video');
@@ -175,8 +243,16 @@ export async function generateVideoThumbnail(
           return reject(new Error('2D context unavailable'));
         }
 
-        ctx.drawImage(video, 0, 0, tw, th);
-        const dataUrl = canvas.toDataURL('image/jpeg', quality);
+        drawImageHighQuality(ctx, video, tw, th);
+        let dataUrl = '';
+        try {
+          dataUrl = canvas.toDataURL('image/webp', quality);
+          if (!dataUrl.startsWith('data:image/webp')) {
+            dataUrl = canvas.toDataURL('image/jpeg', quality);
+          }
+        } catch {
+          dataUrl = canvas.toDataURL('image/jpeg', quality);
+        }
         cleanup();
         resolve(dataUrl);
       } catch (err) {

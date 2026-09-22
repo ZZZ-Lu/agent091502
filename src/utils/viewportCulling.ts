@@ -63,21 +63,34 @@ export function isCardIntersectingRectangle(
 }
 
 /**
+ * Dynamic Nano-LOD Scale Threshold
+ * On 4K / high-density displays (e.g., width >= 2560 or DPR >= 1.5),
+ * cards are physically rendered at much higher pixel density, so pure 2D Canvas mode
+ * is comfortably readable and looks crisp up to scale ~0.85.
+ * On standard monitors, threshold is 0.40 (40%).
+ */
+export function getNanoLodThreshold(): number {
+  if (typeof window === 'undefined') return 0.40;
+  const is4kOrHighDpi = window.innerWidth >= 2560 || (window.devicePixelRatio || 1) >= 1.5;
+  return is4kOrHighDpi ? 0.60 : 0.40;
+}
+
+/**
  * Dynamic LOD-Adaptive Mounting Quotas
  * 
  * Returns the maximum number of DOM cards allowed to mount into the DOM per animation frame.
  * Prioritizes 60fps zooming and panning fluid motion by deferring DOM node mounting.
  * 
  * - While actively zooming or dragging: Quota is 0 (pure GPU matrix transform, 0 new DOM reflows).
- * - Nano-LOD (scale < 0.60): Quota is 0 (pure 2D Canvas rendering, 0 DOM cards).
- * - Micro-LOD (0.60 <= scale < 1.00): High density, gentle progressive reveal: 2 cards / frame.
+ * - Nano-LOD (scale < threshold): Quota is 0 (pure 2D Canvas rendering, 0 DOM cards).
+ * - Micro-LOD (threshold <= scale < 1.00): High density, gentle progressive reveal: 2 cards / frame.
  * - Standard-LOD (1.00 <= scale < 2.00): Standard workspace view: 2 cards / frame.
  * - Macro-LOD (scale >= 2.00): Close-up with heavy 4K texture workloads: 1 card / frame.
  */
 export function getLodMountQuota(scale: number, isInteracting: boolean = false): number {
   if (isInteracting) return 0;
-  if (scale < 0.60) return 0;
-  if (scale < 1.00) return 2;
-  if (scale < 2.00) return 2;
-  return 1;
+  if (scale < getNanoLodThreshold()) return 0;
+  if (scale < 1.00) return 6;
+  if (scale < 2.00) return 4;
+  return 2;
 }
